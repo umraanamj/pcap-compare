@@ -89,7 +89,26 @@ python3 pcap_compare.py GOOD.pcap BAD.pcap CONN1.pcap CONN2.pcap CONN3.pcap
 
 # Force the endpoint source IP used to scope the connector pcaps
 python3 pcap_compare.py --src 10.6.0.2 GOOD.pcap BAD.pcap CONNECTOR.pcap
+
+# Diagnose source-IP matching: dump the IP inventory the script parsed per pcap
+python3 pcap_compare.py --debug GOOD.pcap BAD.pcap CONNECTOR.pcap
 ```
+
+### `--debug`: why isn't my source IP matching?
+
+If you can see a source IP in the pcaps but the script isn't picking it up, run
+with `--debug`. It prints, for every capture, the top source/destination IPs it
+actually parsed, whether the active endpoint IP is present (as source and as
+destination), and — importantly — flags **tunnelled/encapsulated packets** where
+a single `ip.src`/`ip.dst` field carried *two* IPs (outer + inner). Those inner
+IPs are now split out and matched, but the debug view makes the situation
+explicit. The two usual culprits:
+
+- The endpoint IP auto-detected from the BAD capture is the host's **local** IP,
+  while the connector pcaps show a **ZPA-assigned / SNAT'd** source IP. Fix with
+  `--src <the IP you see in the connector pcaps>`.
+- The relevant traffic is **UDP** (e.g. QUIC) — `--debug` shows it in the IP
+  inventory, but TCP-handshake outcomes only apply to TCP flows.
 
 Works with `.pcap` and `.pcapng` (tshark autodetects).
 

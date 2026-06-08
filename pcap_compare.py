@@ -296,6 +296,12 @@ def _truthy(v):
     return v in ("1", "True", "true")
 
 
+def _ips(field):
+    """A tshark ip.src/ip.dst field may hold several comma-joined IPs when the
+    packet is tunnelled/encapsulated (outer + inner). Return them as a list."""
+    return [x for x in field.split(",") if x]
+
+
 def parse_capture(tshark, path):
     """Run one tshark pass and fold rows into a destination-centric profile."""
     cmd = [tshark, "-r", path, "-T", "fields", "-E", "separator=\t"]
@@ -312,6 +318,10 @@ def parse_capture(tshark, path):
     dns_failed = set()               # fqdns queried but NXDOMAIN / no answer
     dns_queried = set()              # every fqdn the client asked about
     dns_query_src = Counter()        # src IP -> # of DNS queries it issued
+    all_src_counts = Counter()       # every packet's IP source (incl. UDP) -> count
+    all_dst_counts = Counter()       # every packet's IP destination (incl. UDP)
+    tunneled_rows = 0                # packets whose IP field held >1 IP (encap)
+    tunneled_examples = []           # a few raw joined fields, for diagnostics
     total_packets = 0
 
     for line in proc.stdout.splitlines():
@@ -322,9 +332,21 @@ def parse_capture(tshark, path):
         if len(cols) < len(TSHARK_FIELDS):
             cols += [""] * (len(TSHARK_FIELDS) - len(cols))
 
-        ip_src = cols[2]
-        ip_dst = cols[3]
+        src_ips = _ips(cols[2])
+        dst_ips = _ips(cols[3])
+        if "," in cols[2] or "," in cols[3]:
+            tunneled_rows += 1
+            if len(tunneled_examples) < 5:
+                tunneled_examples.append(f"{cols[2]} -> {cols[3]}")
+        # Primary src/dst (first listed = outermost) for the existing stream logic;
+        # ips_seen below captures ALL of them so matching works under encapsulation.
+        ip_src = src_ips[0] if src_ips else ""
+        ip_dst = dst_ips[0] if dst_ips else ""
         dstport = cols[4]
+        for ip in src_ips:
+            all_src_counts[ip] += 1
+        for ip in dst_ips:
+            all_dst_counts[ip] += 1
         syn = _truthy(cols[5])
         ack = _truthy(cols[6])
         rst = _truthy(cols[7])
@@ -359,10 +381,8 @@ def parse_capture(tshark, path):
         if stream_id == "":
             continue
         s = streams[stream_id]
-        if ip_src:
-            s.ips_seen.add(ip_src)
-        if ip_dst:
-            s.ips_seen.add(ip_dst)
+        s.ips_seen.update(src_ips)
+        s.ips_seen.update(dst_ips)
 
         # Identify the server from the SYN (syn & !ack -> dst is the server).
         if syn and not ack:
@@ -413,6 +433,10 @@ def parse_capture(tshark, path):
         "client_ips": client_ips,      # Counter: src IP -> #connections initiated
         "all_src_ips": all_src_ips,    # every source IP seen originating a SYN
         "dns_query_src": dns_query_src,  # Counter: src IP -> #DNS queries issued
+        "all_src_counts": all_src_counts,  # per-packet IP source counts (incl. UDP)
+        "all_dst_counts": all_dst_counts,  # per-packet IP destination counts
+        "tunneled_rows": tunneled_rows,
+        "tunneled_examples": tunneled_examples,
     }
 
 
@@ -566,7 +590,7 @@ def _inbound_failures(connectors, endpoint_ips):
     return agg
 
 
-def report(good, bad, connectors=None, src_override=None):
+def report(good, bad, connectors=None, src_override=None, debug=False):
     connectors = connectors or []
     _print_ignore_banner()
 
@@ -580,6 +604,9 @@ def report(good, bad, connectors=None, src_override=None):
         endpoint_ips = set(src_override)
     else:
         endpoint_ips = set(bad.get("dns_query_src") or {}) | set(bad.get("client_ips") or {})
+
+    if debug:
+        _print_debug(good, bad, connectors, endpoint_ips)
 
     # Analyze each connector pcap for that IP as SOURCE or DESTINATION, and run the
     # analysis on just those flows. Connectors that don't contain the IP at all
@@ -663,6 +690,42 @@ def _fmt_dest(d):
     ips = ", ".join(sorted(d["ips"])[:4])
     more = f" +{len(d['ips']) - 4}" if len(d["ips"]) > 4 else ""
     return name, d["port"], f"{ips}{more}"
+
+
+def _print_debug(good, bad, connectors, endpoint_ips):
+    """Dump the IP inventory the script actually parsed from each capture, so a
+    source-IP that 'should be there' but isn't matching can be diagnosed."""
+    print(f"\n{'=' * 60}")
+    print("🐞  DEBUG — IP inventory per capture")
+    print(f"{'=' * 60}")
+    eps = ", ".join(sorted(endpoint_ips)) if endpoint_ips else "(none detected)"
+    print(f"  Active endpoint source IP(s): {eps}")
+
+    rows = [("GOOD endpoint", good), ("BAD endpoint", bad)]
+    rows += [(f"CONNECTOR {os.path.basename(p.get('path', '')) or i}", p)
+             for i, p in enumerate(connectors, 1)]
+    for label, prof in rows:
+        sc = prof.get("all_src_counts", Counter())
+        dc = prof.get("all_dst_counts", Counter())
+        print(f"\n  [{label}]  packets={prof['total_packets']}  "
+              f"tcp_streams={len(prof['streams'])}")
+        tun = prof.get("tunneled_rows", 0)
+        if tun:
+            print(f"    ⚠️  {tun} packet(s) had multiple IPs in one field "
+                  "(tunnelled/encapsulated):")
+            for ex in prof.get("tunneled_examples", []):
+                print(f"          {ex}")
+        print("    top sources:      "
+              + (", ".join(f"{ip}({n})" for ip, n in sc.most_common(8)) or "—"))
+        print("    top destinations: "
+              + (", ".join(f"{ip}({n})" for ip, n in dc.most_common(8)) or "—"))
+        for ip in sorted(endpoint_ips):
+            as_src = sc.get(ip, 0)
+            as_dst = dc.get(ip, 0)
+            ntcp = sum(1 for s in prof["streams"].values() if ip in s.ips_seen)
+            flag = "✓ present" if (as_src or as_dst) else "✗ NOT in this capture"
+            print(f"    → {ip}: as-src={as_src} as-dst={as_dst} "
+                  f"in {ntcp} TCP stream(s)   {flag}")
 
 
 def _print_ignore_banner():
@@ -806,8 +869,9 @@ def _print_unnamed(missing):
 
 
 def _parse_argv(argv):
-    """Pull out --src IP / --src=IP (repeatable, comma-OK) and return (src_list, positionals)."""
-    src, positional, i = [], [], 0
+    """Parse --src IP / --src=IP (repeatable, comma-OK) and --debug.
+    Returns (src_list, debug_bool, positionals)."""
+    src, debug, positional, i = [], False, [], 0
     while i < len(argv):
         a = argv[i]
         if a == "--src" and i + 1 < len(argv):
@@ -818,10 +882,14 @@ def _parse_argv(argv):
             src += [x for x in a.split("=", 1)[1].split(",") if x]
             i += 1
             continue
+        if a == "--debug":
+            debug = True
+            i += 1
+            continue
         if not a.startswith("-"):
             positional.append(a)
         i += 1
-    return src, positional
+    return src, debug, positional
 
 
 def main():
@@ -839,7 +907,7 @@ def main():
         sys.exit(1)
 
     conn_files = []
-    src_override, args = _parse_argv(sys.argv[1:])
+    src_override, debug, args = _parse_argv(sys.argv[1:])
     if len(args) >= 2:
         # CLI mode: pcap_compare.py [--src IP] GOOD BAD [CONNECTOR ...]
         good_file, bad_file = args[0], args[1]
@@ -885,7 +953,7 @@ def main():
         print(f"\n❌ {e}")
         sys.exit(1)
 
-    report(good, bad, connectors, src_override=src_override)
+    report(good, bad, connectors, src_override=src_override, debug=debug)
     print()
 
 
