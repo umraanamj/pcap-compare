@@ -38,15 +38,23 @@ The App Connector source-NATs the client, so flows are correlated by
 server IPs (the same ones in the GOOD capture), they line up cleanly across the
 NAT. The client source IP is still extracted and shown.
 
+**Multiple connectors:** ZPA connector groups load-balance, so an app's flows can
+be brokered by any connector in the group. You can pass **several** App Connector
+captures (multi-select in the dialog, or list them on the command line). They're
+merged into one view and the trace answers *"did **any** connector broker this
+successfully?"* — the best outcome across all of them wins.
+
 ## Usage
 
 ```bash
-# Interactive: file picker for GOOD, then BAD, then an optional App Connector
+# Interactive: file picker for GOOD, then BAD, then optional App Connector(s)
+# (the connector step is multi-select — pick as many as you captured)
 python3 pcap_compare.py
 
-# Or pass captures directly (the connector is optional)
+# Or pass captures directly (connectors are optional, and you can list several)
 python3 pcap_compare.py GOOD.pcap BAD.pcap
 python3 pcap_compare.py GOOD.pcap BAD.pcap CONNECTOR.pcap
+python3 pcap_compare.py GOOD.pcap BAD.pcap CONN1.pcap CONN2.pcap CONN3.pcap
 ```
 
 Works with `.pcap` and `.pcapng` (tshark autodetects).

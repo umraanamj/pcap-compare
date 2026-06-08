@@ -169,6 +169,61 @@ def select_pcap_file(title):
     return entered or None
 
 
+def _pick_multi_with_osascript(title):
+    """Native macOS open dialog allowing multiple selections (POSIX paths)."""
+    prompt = title.replace('"', "'")
+    script = (
+        'set theFiles to choose file with prompt "%s" '
+        'of type {"pcap", "pcapng", "cap"} with multiple selections allowed\n'
+        'set out to ""\n'
+        'repeat with f in theFiles\n'
+        'set out to out & POSIX path of f & linefeed\n'
+        'end repeat\n'
+        'return out' % prompt
+    )
+    proc = subprocess.run(["osascript", "-e", script],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:        # cancelled
+        return []
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def _pick_multi_with_tkinter(title):
+    """Tk multi-select dialog. Returns (available, [paths])."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return False, []
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    paths = filedialog.askopenfilenames(
+        title=title,
+        filetypes=[
+            ("Capture files", "*.pcap *.pcapng *.cap"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+    return True, list(paths)
+
+
+def select_pcap_files(title):
+    """Pick one or more capture files. Returns a (possibly empty) list of paths."""
+    if sys.platform == "darwin":
+        return _pick_multi_with_osascript(title)
+    available, paths = _pick_multi_with_tkinter(title)
+    if available:
+        return paths
+    # Headless fallback: accept a single path (blank = none).
+    try:
+        entered = input(f"{title}\n  path (blank to skip)> ").strip()
+    except EOFError:
+        return []
+    return [entered] if entered else []
+
+
 class StreamStat:
     """Per-TCP-stream rollup used to decide if a connection succeeded."""
 
@@ -363,6 +418,30 @@ def _parent_domain(fqdn):
     return ".".join(parts[-2:])
 
 
+_OUTCOME_RANK = {"ok": 3, "half_open": 2, "reset": 1, "no_response": 0, "unknown": 0}
+
+
+def _merge_dests(dest_dicts):
+    """Merge several destination sets, keeping the BEST outcome per destination
+    and unioning the IPs (used to fold multiple App Connector captures into one)."""
+    merged = {}
+    for dd in dest_dicts:
+        for key, d in dd.items():
+            m = merged.get(key)
+            if m is None:
+                merged[key] = {"fqdn": d["fqdn"], "ips": set(d["ips"]),
+                               "port": d["port"], "outcome": d["outcome"],
+                               "n": d["n"]}
+                continue
+            m["ips"] |= d["ips"]
+            m["n"] += d["n"]
+            if _OUTCOME_RANK[d["outcome"]] > _OUTCOME_RANK[m["outcome"]]:
+                m["outcome"] = d["outcome"]
+            if not m["fqdn"] and d["fqdn"]:
+                m["fqdn"] = d["fqdn"]
+    return merged
+
+
 def _index_dests(dests):
     """Index a destination set by (fqdn, port) and (ip, port) for fast lookup."""
     by_fqdn, by_ip = {}, {}
@@ -386,21 +465,23 @@ def _lookup_dest(d, by_fqdn, by_ip):
     return None
 
 
-def _connector_trace(d, connector, conn_by_fqdn, conn_by_ip):
+def _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip):
     """
     Given a destination that failed for the client, say where it broke relative
-    to the App Connector. Returns a one-line trace string, or None if unknown.
+    to the App Connector(s). Returns a one-line trace string, or None if unknown.
 
-    The App Connector source-NATs the client, so we correlate by DESTINATION
+    App Connectors source-NAT the client, so we correlate by DESTINATION
     (FQDN/IP+port) — the same key the connection uses on both sides of the broker.
+    Multiple connector captures are merged first (best outcome wins), so this is
+    "did ANY connector broker it successfully".
     """
     conn_d = _lookup_dest(d, conn_by_fqdn, conn_by_ip)
     if conn_d is None:
-        # The connector never even tried this destination.
-        if d["fqdn"] and d["fqdn"] in connector.get("dns_failed", set()):
+        # No connector even tried this destination.
+        if d["fqdn"] and d["fqdn"] in conn_dns_failed:
             return ("App Connector tried to resolve it and DNS FAILED there "
                     "→ fix DNS at the connector / app side")
-        return ("never reached the App Connector → broker didn't route it "
+        return ("never reached any App Connector → broker didn't route it "
                 "(Network Presence / App Segment doesn't cover this destination)")
     if conn_d["outcome"] == "ok":
         return ("App Connector reached the server FINE → the break is between "
@@ -418,13 +499,21 @@ def _connector_trace(d, connector, conn_by_fqdn, conn_by_ip):
     return "reached the App Connector, outcome unclear there"
 
 
-def report(good, bad, connector=None):
+def report(good, bad, connectors=None):
+    connectors = connectors or []
     good_dests = build_destinations(good)
     bad_dests = build_destinations(bad)
     bad_by_fqdn, bad_by_ip = _index_dests(bad_dests)
 
-    conn_dests = build_destinations(connector) if connector else {}
-    conn_by_fqdn, conn_by_ip = _index_dests(conn_dests) if connector else ({}, {})
+    # Fold every App Connector capture into one merged view (best outcome wins).
+    per_connector = [(prof, build_destinations(prof)) for prof in connectors]
+    conn_dests = _merge_dests([d for _, d in per_connector])
+    conn_by_fqdn, conn_by_ip = _index_dests(conn_dests)
+    conn_dns_failed = set()
+    conn_src_ips = set()
+    for prof in connectors:
+        conn_dns_failed |= prof.get("dns_failed", set())
+        conn_src_ips |= prof.get("all_src_ips", set())
 
     # Required = destinations the app actually used successfully in the office.
     required = {k: d for k, d in good_dests.items() if d["outcome"] == "ok"}
@@ -458,13 +547,13 @@ def report(good, bad, connector=None):
             reason = "did not complete in the bad capture"
 
         trace = None
-        if connector:
-            trace = _connector_trace(d, connector, conn_by_fqdn, conn_by_ip)
+        if connectors:
+            trace = _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip)
         missing.append((d, reason, trace))
 
-    _print_summary(good, bad, connector, good_dests, bad_dests, conn_dests, required)
-    _print_source_ips(bad, connector)
-    _print_missing(missing, bool(connector))
+    _print_summary(good, bad, per_connector, good_dests, bad_dests, required)
+    _print_source_ips(bad, conn_src_ips, bool(connectors))
+    _print_missing(missing, bool(connectors))
     _print_reachable(reachable)
     _print_unnamed(missing)
 
@@ -476,14 +565,16 @@ def _fmt_dest(d):
     return name, d["port"], f"{ips}{more}"
 
 
-def _print_summary(good, bad, connector, good_dests, bad_dests, conn_dests, required):
+def _print_summary(good, bad, per_connector, good_dests, bad_dests, required):
     print(f"\n{'=' * 60}")
     print("📊  CAPTURE SUMMARY")
     print(f"{'=' * 60}")
     rows = [("GOOD endpoint (office, ZPA off)", good, good_dests),
             ("BAD  endpoint (ZPA on)", bad, bad_dests)]
-    if connector:
-        rows.append(("App Connector (network connector)", connector, conn_dests))
+    for i, (prof, dests) in enumerate(per_connector, 1):
+        name = os.path.basename(prof.get("path", "")) or f"capture {i}"
+        suffix = f" #{i} ({name})" if len(per_connector) > 1 else f" ({name})"
+        rows.append((f"App Connector{suffix}", prof, dests))
     for label, prof, dests in rows:
         ok = sum(1 for d in dests.values() if d["outcome"] == "ok")
         print(f"\n  {label}")
@@ -494,22 +585,21 @@ def _print_summary(good, bad, connector, good_dests, bad_dests, conn_dests, requ
     print(f"\n  → App uses {len(required)} working destination(s) in the office.")
 
 
-def _print_source_ips(bad, connector):
-    """Show the endpoint's source IP(s) and whether they survive to the connector."""
+def _print_source_ips(bad, conn_src_ips, has_connector):
+    """Show the endpoint's source IP(s) and whether they survive to the connector(s)."""
     src = bad.get("client_ips")
     if not src:
         return
     top = src.most_common(5)
     pretty = ", ".join(f"{ip} ({n})" for ip, n in top)
     print(f"\n  Endpoint source IP(s) in the BAD capture: {pretty}")
-    if connector:
-        conn_src = connector.get("all_src_ips", set())
-        preserved = [ip for ip, _ in top if ip in conn_src]
+    if has_connector:
+        preserved = [ip for ip, _ in top if ip in conn_src_ips]
         if preserved:
-            print(f"    These same source IP(s) appear at the connector "
+            print(f"    These same source IP(s) appear at the connector(s) "
                   f"({', '.join(preserved)}) — source is preserved, not NAT'd.")
         else:
-            print("    None of these appear as a source at the connector — the "
+            print("    None of these appear as a source at the connector(s) — the "
                   "App Connector source-NATs the client, so flows below are\n"
                   "    correlated by DESTINATION (FQDN/IP+port), which is reliable "
                   "across the NAT.")
@@ -584,21 +674,20 @@ def main():
         )
         sys.exit(1)
 
-    conn_file = None
+    conn_files = []
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if len(args) in (2, 3):
-        # CLI mode: pcap_compare.py GOOD BAD [CONNECTOR]
+    if len(args) >= 2:
+        # CLI mode: pcap_compare.py GOOD BAD [CONNECTOR ...]
         good_file, bad_file = args[0], args[1]
-        conn_file = args[2] if len(args) == 3 else None
+        conn_files = args[2:]
         checks = [("GOOD", good_file), ("BAD", bad_file)]
-        if conn_file:
-            checks.append(("CONNECTOR", conn_file))
+        checks += [("CONNECTOR", f) for f in conn_files]
         for label, f in checks:
             if not os.path.isfile(f):
                 print(f"❌ {label} capture not found: {f}")
                 sys.exit(1)
     elif args:
-        print("Usage: pcap_compare.py [GOOD BAD [CONNECTOR]]   (no args = file pickers)")
+        print("Usage: pcap_compare.py [GOOD BAD [CONNECTOR ...]]   (no args = file pickers)")
         sys.exit(1)
     else:
         print("\n📂 Select the GOOD endpoint capture — office, ZPA/VPN OFF…")
@@ -613,24 +702,25 @@ def main():
             print("❌ No bad capture selected. Exiting.")
             return
 
-        print("📂 (Optional) Select the App Connector capture — cancel to skip…")
-        conn_file = select_pcap_file("Select App Connector pcap (optional — cancel to skip)")
+        print("📂 (Optional) Select App Connector capture(s) — multi-select OK, cancel to skip…")
+        conn_files = select_pcap_files(
+            "Select App Connector pcap(s) (optional — multi-select, cancel to skip)")
 
     print(f"\n  Good endpoint: {good_file}")
     print(f"  Bad endpoint:  {bad_file}")
-    if conn_file:
-        print(f"  App Connector: {conn_file}")
+    for i, f in enumerate(conn_files, 1):
+        print(f"  App Connector {i}: {f}")
     print("\n⏳ Analyzing with tshark…")
 
     try:
         good = parse_capture(tshark, good_file)
         bad = parse_capture(tshark, bad_file)
-        connector = parse_capture(tshark, conn_file) if conn_file else None
+        connectors = [parse_capture(tshark, f) for f in conn_files]
     except RuntimeError as e:
         print(f"\n❌ {e}")
         sys.exit(1)
 
-    report(good, bad, connector)
+    report(good, bad, connectors)
     print()
 
 
