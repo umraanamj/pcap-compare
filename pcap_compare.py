@@ -67,18 +67,43 @@ TSHARK_FIELDS = [
 ]
 
 
+def _windows_tshark_candidates():
+    """Likely tshark.exe locations on Windows (env vars + registry, no hardcoding)."""
+    candidates = []
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(var)
+        if base:
+            candidates.append(os.path.join(base, "Wireshark", "tshark.exe"))
+    # The Wireshark installer records its install dir in the registry.
+    try:
+        import winreg
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, r"SOFTWARE\Wireshark") as key:
+                    install_dir = winreg.QueryValueEx(key, "InstallDir")[0]
+                    candidates.append(os.path.join(install_dir, "tshark.exe"))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return candidates
+
+
 def find_tshark():
-    """Locate tshark on PATH or in a standard Wireshark install (macOS/Windows)."""
+    """Locate tshark on PATH or in a standard Wireshark install, per-OS."""
+    # 1. Already on PATH? (works everywhere)
     path = shutil.which("tshark") or shutil.which("tshark.exe")
     if path:
         return path
-    # Wireshark is often not on PATH, especially on Windows. Check the usual spots.
-    for candidate in (
-        "/Applications/Wireshark.app/Contents/MacOS/tshark",   # macOS
-        r"C:\Program Files\Wireshark\tshark.exe",              # Windows 64-bit
-        r"C:\Program Files (x86)\Wireshark\tshark.exe",        # Windows 32-bit
-    ):
-        if os.path.exists(candidate):
+    # 2. Wireshark is often not on PATH — check OS-specific install locations.
+    if sys.platform.startswith("win"):
+        candidates = _windows_tshark_candidates()
+    elif sys.platform == "darwin":
+        candidates = ["/Applications/Wireshark.app/Contents/MacOS/tshark"]
+    else:
+        candidates = ["/usr/bin/tshark", "/usr/local/bin/tshark"]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
             return candidate
     return None
 
