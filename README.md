@@ -17,6 +17,11 @@ It enumerates every destination the app talks to in the GOOD capture, then
 reports which ones **fail or never appear** in the BAD capture — i.e. the
 IPs/FQDNs you need to add to the Application Segment.
 
+> **Microsoft / Google traffic is ignored for now.** That telemetry/CDN noise
+> isn't something we need to ingest, so those destinations are excluded from the
+> report (and the script says so at runtime). The match is by FQDN suffix —
+> edit the `IGNORED_VENDORS` lists at the top of `pcap_compare.py` to change it.
+
 ### Adding the App Connector capture (where does it break?)
 
 ZPA tunnel traffic has two halves: the **endpoint** (Client Connector) and the
@@ -33,10 +38,19 @@ which side of the broker the flow died on:
 - **App Connector reached the server fine** → the break is between the client and
   the connector (broker / return path), not the app.
 
-The App Connector source-NATs the client, so flows are correlated by
-**destination** (FQDN/IP+port) — and because the connector dials the **real**
-server IPs (the same ones in the GOOD capture), they line up cleanly across the
-NAT. The client source IP is still extracted and shown.
+**Source-IP correlation:** the tool reads the endpoint's source IP from the BAD
+capture — specifically *who is issuing the DNS queries* — and looks for that same
+source IP in each connector capture:
+
+- If the source IP **is visible** at a connector (source preserved), that
+  connector is **scoped to traffic from/to that source IP** — i.e. it looks only
+  at the conversations that endpoint actually had.
+- If it **isn't visible** (the App Connector source-NATs the client, the usual
+  case), flows are correlated by **destination** (FQDN/IP+port) instead. That
+  still works because the connector dials the **real** server IPs — the same ones
+  in the GOOD capture — so they line up cleanly across the NAT.
+
+Either way the script prints which mode each connector capture is using.
 
 **Multiple connectors:** ZPA connector groups load-balance, so an app's flows can
 be brokered by any connector in the group. You can pass **several** App Connector

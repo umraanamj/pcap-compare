@@ -77,6 +77,38 @@ TSHARK_FIELDS = [
     "dns.flags.rcode",                      # 15 0 = ok, 3 = NXDOMAIN, etc.
 ]
 
+# Vendors whose traffic we deliberately IGNORE for now (telemetry / CDN noise the
+# app doesn't depend on). Matched by FQDN suffix. Edit these lists to taste.
+IGNORED_VENDORS = {
+    "Microsoft": (
+        "microsoft.com", "microsoftonline.com", "windows.com", "windowsupdate.com",
+        "office.com", "office.net", "office365.com", "live.com", "outlook.com",
+        "msn.com", "bing.com", "azure.com", "azureedge.net", "azurewebsites.net",
+        "windows.net", "msftncsi.com", "msftconnecttest.com", "msedge.net",
+        "msecnd.net", "msauth.net", "msftauth.net", "sharepoint.com",
+        "onedrive.com", "skype.com", "xboxlive.com", "trafficmanager.net",
+        "s-microsoft.com",
+    ),
+    "Google": (
+        "google.com", "googleapis.com", "gstatic.com", "googleusercontent.com",
+        "ggpht.com", "googlevideo.com", "gvt1.com", "gvt2.com", "gvt3.com",
+        "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+        "doubleclick.net", "youtube.com", "ytimg.com", "googlemail.com",
+        "gmail.com", "android.com",
+    ),
+}
+
+
+def ignored_vendor(fqdn):
+    """Return the vendor name if this FQDN belongs to an ignored vendor, else None."""
+    if not fqdn:
+        return None
+    f = fqdn.rstrip(".").lower()
+    for vendor, suffixes in IGNORED_VENDORS.items():
+        if any(f == s or f.endswith("." + s) for s in suffixes):
+            return vendor
+    return None
+
 
 def _windows_tshark_candidates():
     """Likely tshark.exe locations on Windows (env vars + registry, no hardcoding)."""
@@ -278,6 +310,7 @@ def parse_capture(tshark, path):
     dns_resolved = set()             # fqdns that got at least one good answer
     dns_failed = set()               # fqdns queried but NXDOMAIN / no answer
     dns_queried = set()              # every fqdn the client asked about
+    dns_query_src = Counter()        # src IP -> # of DNS queries it issued
     total_packets = 0
 
     for line in proc.stdout.splitlines():
@@ -306,6 +339,9 @@ def parse_capture(tshark, path):
         # --- DNS bookkeeping -------------------------------------------------
         if dns_name:
             dns_queried.add(dns_name)
+            if not dns_is_resp and ip_src:
+                # Who is asking — the endpoint host issuing the lookup.
+                dns_query_src[ip_src] += 1
             if dns_is_resp:
                 ips = dns_a + dns_aaaa
                 if ips:
@@ -371,17 +407,23 @@ def parse_capture(tshark, path):
         "ip_fqdn": dict(ip_fqdn),
         "client_ips": client_ips,      # Counter: src IP -> #connections initiated
         "all_src_ips": all_src_ips,    # every source IP seen originating a SYN
+        "dns_query_src": dns_query_src,  # Counter: src IP -> #DNS queries issued
     }
 
 
-def build_destinations(profile):
+def build_destinations(profile, only_client_ips=None):
     """
     Collapse streams into destinations keyed by (fqdn, port) when an FQDN is
     known, else (ip, port). Returns {key: {fqdn, ips, port, outcome, n}}.
+
+    If only_client_ips is given, only streams originated by one of those source
+    IPs are counted — used to scope a connector capture to a specific endpoint.
     """
     rank = {"ok": 3, "half_open": 2, "reset": 1, "no_response": 0, "unknown": 0}
     dests = {}
     for s in profile["streams"].values():
+        if only_client_ips is not None and s.client_ip not in only_client_ips:
+            continue
         if not s.server_ip:
             continue
         # Best FQDN for this stream: SNI > Host > reverse-DNS of the server IP.
@@ -501,22 +543,51 @@ def _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip):
 
 def report(good, bad, connectors=None):
     connectors = connectors or []
+    _print_ignore_banner()
+
     good_dests = build_destinations(good)
     bad_dests = build_destinations(bad)
     bad_by_fqdn, bad_by_ip = _index_dests(bad_dests)
 
+    # The endpoint source IP(s) — who is making the DNS queries in the BAD logs.
+    endpoint_src = set(bad.get("dns_query_src") or {})
+    if not endpoint_src:
+        endpoint_src = set(bad.get("all_src_ips") or set())
+
     # Fold every App Connector capture into one merged view (best outcome wins).
-    per_connector = [(prof, build_destinations(prof)) for prof in connectors]
+    # If the endpoint's source IP is visible at a connector (source preserved,
+    # not NAT'd), SCOPE that connector to flows from/to that source IP; otherwise
+    # fall back to destination correlation across the NAT.
+    per_connector = []
+    scoping = []   # (profile, scoped_bool, [matched src ips])
+    for prof in connectors:
+        prof_src = prof.get("all_src_ips", set())
+        shared = sorted(endpoint_src & prof_src) if endpoint_src else []
+        if shared:
+            dests = build_destinations(prof, only_client_ips=endpoint_src)
+            scoping.append((prof, True, shared))
+        else:
+            dests = build_destinations(prof)
+            scoping.append((prof, False, []))
+        per_connector.append((prof, dests))
     conn_dests = _merge_dests([d for _, d in per_connector])
     conn_by_fqdn, conn_by_ip = _index_dests(conn_dests)
     conn_dns_failed = set()
-    conn_src_ips = set()
     for prof in connectors:
         conn_dns_failed |= prof.get("dns_failed", set())
-        conn_src_ips |= prof.get("all_src_ips", set())
 
-    # Required = destinations the app actually used successfully in the office.
-    required = {k: d for k, d in good_dests.items() if d["outcome"] == "ok"}
+    # Required = destinations the app used successfully in the office, MINUS the
+    # ignored vendors (Microsoft / Google).
+    required = {}
+    ignored = []
+    for k, d in good_dests.items():
+        if d["outcome"] != "ok":
+            continue
+        vendor = ignored_vendor(d["fqdn"])
+        if vendor:
+            ignored.append((d, vendor))
+        else:
+            required[k] = d
 
     reachable, missing = [], []
     for (_, port), d in required.items():
@@ -551,8 +622,8 @@ def report(good, bad, connectors=None):
             trace = _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip)
         missing.append((d, reason, trace))
 
-    _print_summary(good, bad, per_connector, good_dests, bad_dests, required)
-    _print_source_ips(bad, conn_src_ips, bool(connectors))
+    _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ignored)
+    _print_correlation(endpoint_src, scoping, bool(connectors))
     _print_missing(missing, bool(connectors))
     _print_reachable(reachable)
     _print_unnamed(missing)
@@ -565,7 +636,14 @@ def _fmt_dest(d):
     return name, d["port"], f"{ips}{more}"
 
 
-def _print_summary(good, bad, per_connector, good_dests, bad_dests, required):
+def _print_ignore_banner():
+    vendors = " / ".join(IGNORED_VENDORS)
+    print(f"\nℹ️  Ignoring {vendors} traffic for now (telemetry / CDN noise the app")
+    print("    doesn't depend on). Those destinations are excluded from this report.")
+    print("    Matched by FQDN suffix — edit IGNORED_VENDORS in the script to change.")
+
+
+def _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ignored):
     print(f"\n{'=' * 60}")
     print("📊  CAPTURE SUMMARY")
     print(f"{'=' * 60}")
@@ -582,26 +660,30 @@ def _print_summary(good, bad, per_connector, good_dests, bad_dests, required):
         print(f"    TCP destinations .... {len(dests)}  ({ok} reached OK)")
         print(f"    FQDNs resolved ...... {len(prof['dns_resolved'])}")
         print(f"    DNS lookups failed .. {len(prof['dns_failed'])}")
-    print(f"\n  → App uses {len(required)} working destination(s) in the office.")
+    print(f"\n  → App uses {len(required)} working destination(s) in the office "
+          "(after exclusions).")
+    if ignored:
+        by_vendor = Counter(v for _, v in ignored)
+        breakdown = ", ".join(f"{v}: {n}" for v, n in by_vendor.items())
+        print(f"  → Excluded {len(ignored)} ignored destination(s)  ({breakdown}).")
 
 
-def _print_source_ips(bad, conn_src_ips, has_connector):
-    """Show the endpoint's source IP(s) and whether they survive to the connector(s)."""
-    src = bad.get("client_ips")
-    if not src:
+def _print_correlation(endpoint_src, scoping, has_connector):
+    """Show the endpoint source IP(s) and how each connector capture is correlated."""
+    if endpoint_src:
+        shown = ", ".join(sorted(endpoint_src)[:6])
+        print(f"\n  Endpoint source IP(s) issuing DNS queries (BAD capture): {shown}")
+    if not has_connector:
         return
-    top = src.most_common(5)
-    pretty = ", ".join(f"{ip} ({n})" for ip, n in top)
-    print(f"\n  Endpoint source IP(s) in the BAD capture: {pretty}")
-    if has_connector:
-        preserved = [ip for ip, _ in top if ip in conn_src_ips]
-        if preserved:
-            print(f"    These same source IP(s) appear at the connector(s) "
-                  f"({', '.join(preserved)}) — source is preserved, not NAT'd.")
+    for prof, scoped, shared in scoping:
+        name = os.path.basename(prof.get("path", "")) or "connector"
+        if scoped:
+            print(f"    • {name}: source {', '.join(shared)} IS visible here — "
+                  "scoped to traffic from/to that source IP.")
         else:
-            print("    None of these appear as a source at the connector(s) — the "
-                  "App Connector source-NATs the client, so flows below are\n"
-                  "    correlated by DESTINATION (FQDN/IP+port), which is reliable "
+            print(f"    • {name}: endpoint source IP not visible (App Connector "
+                  "source-NATs the client)\n"
+                  "        → correlated by DESTINATION (FQDN/IP+port), reliable "
                   "across the NAT.")
 
 
