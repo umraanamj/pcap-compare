@@ -263,6 +263,7 @@ class StreamStat:
         self.client_ip = None   # source of the SYN — the endpoint making the request
         self.server_ip = None
         self.server_port = None
+        self.ips_seen = set()   # every IP seen in this stream (src or dst, both dirs)
         self.syn = False
         self.syn_ack = False
         self.rst = False
@@ -358,6 +359,10 @@ def parse_capture(tshark, path):
         if stream_id == "":
             continue
         s = streams[stream_id]
+        if ip_src:
+            s.ips_seen.add(ip_src)
+        if ip_dst:
+            s.ips_seen.add(ip_dst)
 
         # Identify the server from the SYN (syn & !ack -> dst is the server).
         if syn and not ack:
@@ -411,18 +416,19 @@ def parse_capture(tshark, path):
     }
 
 
-def build_destinations(profile, only_client_ips=None):
+def build_destinations(profile, only_involving_ips=None):
     """
     Collapse streams into destinations keyed by (fqdn, port) when an FQDN is
     known, else (ip, port). Returns {key: {fqdn, ips, port, outcome, n}}.
 
-    If only_client_ips is given, only streams originated by one of those source
-    IPs are counted — used to scope a connector capture to a specific endpoint.
+    If only_involving_ips is given, only streams in which one of those IPs appears
+    (as source OR destination, either direction) are counted — used to scope a
+    connector capture to a specific endpoint source IP.
     """
     rank = {"ok": 3, "half_open": 2, "reset": 1, "no_response": 0, "unknown": 0}
     dests = {}
     for s in profile["streams"].values():
-        if only_client_ips is not None and s.client_ip not in only_client_ips:
+        if only_involving_ips is not None and not (s.ips_seen & only_involving_ips):
             continue
         if not s.server_ip:
             continue
@@ -541,7 +547,7 @@ def _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip):
     return "reached the App Connector, outcome unclear there"
 
 
-def report(good, bad, connectors=None):
+def report(good, bad, connectors=None, src_override=None):
     connectors = connectors or []
     _print_ignore_banner()
 
@@ -549,28 +555,28 @@ def report(good, bad, connectors=None):
     bad_dests = build_destinations(bad)
     bad_by_fqdn, bad_by_ip = _index_dests(bad_dests)
 
-    # The endpoint source IP(s) — who is making the DNS queries in the BAD logs.
-    endpoint_src = set(bad.get("dns_query_src") or {})
-    if not endpoint_src:
-        endpoint_src = set(bad.get("all_src_ips") or set())
+    # The endpoint source IP(s), pulled from the BAD tunnel packets: whoever
+    # issues the DNS queries / originates the connections. Overridable with --src.
+    if src_override:
+        endpoint_ips = set(src_override)
+    else:
+        endpoint_ips = set(bad.get("dns_query_src") or {}) | set(bad.get("client_ips") or {})
 
-    # Fold every App Connector capture into one merged view (best outcome wins).
-    # If the endpoint's source IP is visible at a connector (source preserved,
-    # not NAT'd), SCOPE that connector to flows from/to that source IP; otherwise
-    # fall back to destination correlation across the NAT.
-    per_connector = []
-    scoping = []   # (profile, scoped_bool, [matched src ips])
+    # Analyze each connector pcap for that IP as SOURCE or DESTINATION, and run the
+    # analysis on just those flows. Connectors that don't contain the IP at all
+    # contribute nothing (and are flagged — likely NAT'd or the wrong capture).
+    per_connector = []   # (profile, scoped_dests, matched_flow_count)
     for prof in connectors:
-        prof_src = prof.get("all_src_ips", set())
-        shared = sorted(endpoint_src & prof_src) if endpoint_src else []
-        if shared:
-            dests = build_destinations(prof, only_client_ips=endpoint_src)
-            scoping.append((prof, True, shared))
+        if endpoint_ips:
+            dests = build_destinations(prof, only_involving_ips=endpoint_ips)
+            matched = sum(1 for s in prof["streams"].values()
+                          if s.ips_seen & endpoint_ips)
         else:
             dests = build_destinations(prof)
-            scoping.append((prof, False, []))
-        per_connector.append((prof, dests))
-    conn_dests = _merge_dests([d for _, d in per_connector])
+            matched = len(prof["streams"])
+        per_connector.append((prof, dests, matched))
+    connector_usable = any(m > 0 for _, _, m in per_connector)
+    conn_dests = _merge_dests([d for _, d, _ in per_connector])
     conn_by_fqdn, conn_by_ip = _index_dests(conn_dests)
     conn_dns_failed = set()
     for prof in connectors:
@@ -618,13 +624,15 @@ def report(good, bad, connectors=None):
             reason = "did not complete in the bad capture"
 
         trace = None
-        if connectors:
+        if connectors and connector_usable:
             trace = _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip)
         missing.append((d, reason, trace))
 
+    show_conn = bool(connectors) and connector_usable
     _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ignored)
-    _print_correlation(endpoint_src, scoping, bool(connectors))
-    _print_missing(missing, bool(connectors))
+    _print_correlation(endpoint_ips, per_connector, bool(connectors),
+                       connector_usable, bool(src_override))
+    _print_missing(missing, show_conn)
     _print_reachable(reachable)
     _print_unnamed(missing)
 
@@ -647,16 +655,18 @@ def _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ig
     print(f"\n{'=' * 60}")
     print("📊  CAPTURE SUMMARY")
     print(f"{'=' * 60}")
-    rows = [("GOOD endpoint (office, ZPA off)", good, good_dests),
-            ("BAD  endpoint (ZPA on)", bad, bad_dests)]
-    for i, (prof, dests) in enumerate(per_connector, 1):
+    rows = [("GOOD endpoint (office, ZPA off)", good, good_dests, None),
+            ("BAD  endpoint (ZPA on)", bad, bad_dests, None)]
+    for i, (prof, dests, matched) in enumerate(per_connector, 1):
         name = os.path.basename(prof.get("path", "")) or f"capture {i}"
         suffix = f" #{i} ({name})" if len(per_connector) > 1 else f" ({name})"
-        rows.append((f"App Connector{suffix}", prof, dests))
-    for label, prof, dests in rows:
+        rows.append((f"App Connector{suffix}", prof, dests, matched))
+    for label, prof, dests, matched in rows:
         ok = sum(1 for d in dests.values() if d["outcome"] == "ok")
         print(f"\n  {label}")
         print(f"    packets ............. {prof['total_packets']}")
+        if matched is not None:
+            print(f"    flows w/ source IP .. {matched}")
         print(f"    TCP destinations .... {len(dests)}  ({ok} reached OK)")
         print(f"    FQDNs resolved ...... {len(prof['dns_resolved'])}")
         print(f"    DNS lookups failed .. {len(prof['dns_failed'])}")
@@ -668,23 +678,34 @@ def _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ig
         print(f"  → Excluded {len(ignored)} ignored destination(s)  ({breakdown}).")
 
 
-def _print_correlation(endpoint_src, scoping, has_connector):
-    """Show the endpoint source IP(s) and how each connector capture is correlated."""
-    if endpoint_src:
-        shown = ", ".join(sorted(endpoint_src)[:6])
-        print(f"\n  Endpoint source IP(s) issuing DNS queries (BAD capture): {shown}")
+def _print_correlation(endpoint_ips, per_connector, has_connector,
+                       connector_usable, overridden):
+    """Show the endpoint source IP and how each connector capture matched it."""
+    if endpoint_ips:
+        shown = ", ".join(sorted(endpoint_ips)[:6])
+        origin = "from --src" if overridden else "from BAD tunnel packets"
+        print(f"\n  Endpoint source IP(s) ({origin}): {shown}")
+    else:
+        print("\n  ⚠️  No endpoint source IP found in the BAD capture "
+              "(use --src IP to set it).")
     if not has_connector:
         return
-    for prof, scoped, shared in scoping:
+    print("  Connector pcaps analyzed for that IP as source/destination:")
+    for prof, dests, matched in per_connector:
         name = os.path.basename(prof.get("path", "")) or "connector"
-        if scoped:
-            print(f"    • {name}: source {', '.join(shared)} IS visible here — "
-                  "scoped to traffic from/to that source IP.")
+        if matched > 0:
+            print(f"    • {name}: {matched} flow(s) involving the source IP "
+                  f"→ {len(dests)} destination(s) analyzed.")
         else:
-            print(f"    • {name}: endpoint source IP not visible (App Connector "
-                  "source-NATs the client)\n"
-                  "        → correlated by DESTINATION (FQDN/IP+port), reliable "
-                  "across the NAT.")
+            print(f"    • {name}: source IP NOT seen here — nothing to analyze "
+                  "(App Connector may NAT the client, or wrong capture).")
+    if not connector_usable:
+        print("\n  ⚠️  The endpoint source IP doesn't appear in ANY connector "
+              "capture, so connector\n"
+              "      break-point tracing is skipped. Either the connector "
+              "source-NATs the client\n"
+              "      (capture where the tunnel source is visible), or pass the "
+              "right IP with --src.")
 
 
 def _print_missing(missing, has_connector):
@@ -742,6 +763,25 @@ def _print_unnamed(missing):
         print(f"  • {ips}:{d['port']}")
 
 
+def _parse_argv(argv):
+    """Pull out --src IP / --src=IP (repeatable, comma-OK) and return (src_list, positionals)."""
+    src, positional, i = [], [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--src" and i + 1 < len(argv):
+            src += [x for x in argv[i + 1].split(",") if x]
+            i += 2
+            continue
+        if a.startswith("--src="):
+            src += [x for x in a.split("=", 1)[1].split(",") if x]
+            i += 1
+            continue
+        if not a.startswith("-"):
+            positional.append(a)
+        i += 1
+    return src, positional
+
+
 def main():
     print("🔍 PCAP Compare — ZPA Network Presence coverage finder")
     print("=" * 60)
@@ -757,9 +797,9 @@ def main():
         sys.exit(1)
 
     conn_files = []
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    src_override, args = _parse_argv(sys.argv[1:])
     if len(args) >= 2:
-        # CLI mode: pcap_compare.py GOOD BAD [CONNECTOR ...]
+        # CLI mode: pcap_compare.py [--src IP] GOOD BAD [CONNECTOR ...]
         good_file, bad_file = args[0], args[1]
         conn_files = args[2:]
         checks = [("GOOD", good_file), ("BAD", bad_file)]
@@ -769,7 +809,8 @@ def main():
                 print(f"❌ {label} capture not found: {f}")
                 sys.exit(1)
     elif args:
-        print("Usage: pcap_compare.py [GOOD BAD [CONNECTOR ...]]   (no args = file pickers)")
+        print("Usage: pcap_compare.py [--src IP] [GOOD BAD [CONNECTOR ...]]"
+              "   (no args = file pickers)")
         sys.exit(1)
     else:
         print("\n📂 Select the GOOD endpoint capture — office, ZPA/VPN OFF…")
@@ -802,7 +843,7 @@ def main():
         print(f"\n❌ {e}")
         sys.exit(1)
 
-    report(good, bad, connectors)
+    report(good, bad, connectors, src_override=src_override)
     print()
 
 

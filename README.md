@@ -38,19 +38,24 @@ which side of the broker the flow died on:
 - **App Connector reached the server fine** → the break is between the client and
   the connector (broker / return path), not the app.
 
-**Source-IP correlation:** the tool reads the endpoint's source IP from the BAD
-capture — specifically *who is issuing the DNS queries* — and looks for that same
-source IP in each connector capture:
+**Source-IP correlation:** the tool pulls the endpoint's source IP from the BAD
+tunnel packets (whoever issues the DNS queries / originates the connections),
+then analyzes each connector pcap for **that IP as a source *or* destination** and
+runs the break-point analysis on just those flows. The script prints, per
+connector, how many flows involving that IP it found:
 
-- If the source IP **is visible** at a connector (source preserved), that
-  connector is **scoped to traffic from/to that source IP** — i.e. it looks only
-  at the conversations that endpoint actually had.
-- If it **isn't visible** (the App Connector source-NATs the client, the usual
-  case), flows are correlated by **destination** (FQDN/IP+port) instead. That
-  still works because the connector dials the **real** server IPs — the same ones
-  in the GOOD capture — so they line up cleanly across the NAT.
+```
+Endpoint source IP(s) (from BAD tunnel packets): 10.6.0.2
+Connector pcaps analyzed for that IP as source/destination:
+  • appconn1.pcap: 14 flow(s) involving the source IP → 9 destination(s) analyzed.
+```
 
-Either way the script prints which mode each connector capture is using.
+If the IP doesn't appear in a connector capture (the App Connector source-NATs
+the client, or it's the wrong capture), that connector contributes nothing and is
+flagged; if it's absent from **every** connector, break-point tracing is skipped
+with a warning. Override the auto-detected IP with `--src IP` (repeatable, or
+comma-separated) — e.g. when the connector sees a ZPA-assigned source IP that
+differs from the endpoint's local IP.
 
 **Multiple connectors:** ZPA connector groups load-balance, so an app's flows can
 be brokered by any connector in the group. You can pass **several** App Connector
@@ -69,6 +74,9 @@ python3 pcap_compare.py
 python3 pcap_compare.py GOOD.pcap BAD.pcap
 python3 pcap_compare.py GOOD.pcap BAD.pcap CONNECTOR.pcap
 python3 pcap_compare.py GOOD.pcap BAD.pcap CONN1.pcap CONN2.pcap CONN3.pcap
+
+# Force the endpoint source IP used to scope the connector pcaps
+python3 pcap_compare.py --src 10.6.0.2 GOOD.pcap BAD.pcap CONNECTOR.pcap
 ```
 
 Works with `.pcap` and `.pcapng` (tshark autodetects).
