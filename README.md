@@ -19,15 +19,22 @@ IPs/FQDNs you need to add to the Application Segment.
 ## Usage
 
 ```bash
+# Interactive: pops a file picker for the GOOD capture, then the BAD capture
 python3 pcap_compare.py
+
+# Or pass the two captures directly (no dialogs)
+python3 pcap_compare.py GOOD.pcap BAD.pcap
 ```
 
-On launch it pops a native file picker for the **GOOD** capture, then the
-**BAD** capture. Works with `.pcap` and `.pcapng` (tshark autodetects).
+Works with `.pcap` and `.pcapng` (tshark autodetects).
 
 ## Requirements
 
-- **Python 3** (standard library only — uses `tkinter` for the file dialogs).
+- **Python 3** — standard library only, no `pip install` needed.
+  - On **macOS** the file pickers use the native dialog (`osascript`), so
+    **tkinter is not required**. On other platforms it uses `tkinter`, falling
+    back to a terminal prompt if Tk isn't available. Either way, the
+    `GOOD BAD` command-line form sidesteps the dialogs entirely.
 - **Wireshark's `tshark`** on your PATH.
   - macOS: `brew install --cask wireshark` (tshark ships inside
     `Wireshark.app/Contents/MacOS/`, which the script also checks automatically).

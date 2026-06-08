@@ -17,7 +17,13 @@ The script enumerates every destination the app talks to in the GOOD capture,
 then reports which ones FAIL or never appear in the BAD capture — i.e. the
 IPs/FQDNs you need to add to the Application Segment.
 
-Launch flow (unchanged): file picker for the GOOD capture, then the BAD capture.
+Launch flow: a file picker for the GOOD capture, then the BAD capture. On macOS
+the picker is the native dialog (osascript) so no tkinter is needed; other
+platforms use tkinter, falling back to a terminal prompt. You can also pass the
+two files on the command line:
+
+    python3 pcap_compare.py GOOD.pcap BAD.pcap
+
 Works with .pcap and .pcapng (tshark autodetects).
 
 Key design choices
@@ -39,9 +45,6 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
-
-import tkinter as tk
-from tkinter import filedialog
 
 # Single-pass tshark field list. Order maps to the indices used in parse_capture.
 TSHARK_FIELDS = [
@@ -75,12 +78,31 @@ def find_tshark():
     return None
 
 
-def select_pcap_file(title):
-    """Open a native file-picker dialog for a pcap / pcapng file."""
+def _pick_with_osascript(title):
+    """Native macOS open dialog via osascript — needs no tkinter/Tk."""
+    prompt = title.replace('"', "'")
+    script = (
+        'POSIX path of (choose file with prompt "%s" '
+        'of type {"pcap", "pcapng", "cap"})' % prompt
+    )
+    proc = subprocess.run(["osascript", "-e", script],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:        # user cancelled (-128) or no selection
+        return None
+    return proc.stdout.strip() or None
+
+
+def _pick_with_tkinter(title):
+    """Tk file dialog. Returns (available, path). available=False if no Tk."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return False, None
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    file_path = filedialog.askopenfilename(
+    path = filedialog.askopenfilename(
         title=title,
         filetypes=[
             ("Capture files", "*.pcap *.pcapng *.cap"),
@@ -88,7 +110,22 @@ def select_pcap_file(title):
         ],
     )
     root.destroy()
-    return file_path
+    return True, (path or None)
+
+
+def select_pcap_file(title):
+    """Pick a capture file: native dialog on macOS, Tk elsewhere, then prompt."""
+    if sys.platform == "darwin":
+        return _pick_with_osascript(title)
+    available, path = _pick_with_tkinter(title)
+    if available:
+        return path
+    # Headless / no Tk: fall back to a terminal prompt.
+    try:
+        entered = input(f"{title}\n  path> ").strip()
+    except EOFError:
+        return None
+    return entered or None
 
 
 class StreamStat:
@@ -423,17 +460,29 @@ def main():
         )
         sys.exit(1)
 
-    print("\n📂 Select the GOOD capture — office, ZPA/VPN OFF (full access)…")
-    good_file = select_pcap_file("Select GOOD pcap / pcapng (ZPA off, working)")
-    if not good_file:
-        print("❌ No good capture selected. Exiting.")
-        return
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if len(args) == 2:
+        # CLI mode: python3 pcap_compare.py GOOD.pcap BAD.pcap
+        good_file, bad_file = args
+        for label, f in (("GOOD", good_file), ("BAD", bad_file)):
+            if not os.path.isfile(f):
+                print(f"❌ {label} capture not found: {f}")
+                sys.exit(1)
+    elif args:
+        print("Usage: pcap_compare.py [GOOD.pcap BAD.pcap]   (no args = file pickers)")
+        sys.exit(1)
+    else:
+        print("\n📂 Select the GOOD capture — office, ZPA/VPN OFF (full access)…")
+        good_file = select_pcap_file("Select GOOD pcap / pcapng (ZPA off, working)")
+        if not good_file:
+            print("❌ No good capture selected. Exiting.")
+            return
 
-    print("📂 Select the BAD capture — ZPA / Network Presence ON (failing)…")
-    bad_file = select_pcap_file("Select BAD pcap / pcapng (ZPA on, failing)")
-    if not bad_file:
-        print("❌ No bad capture selected. Exiting.")
-        return
+        print("📂 Select the BAD capture — ZPA / Network Presence ON (failing)…")
+        bad_file = select_pcap_file("Select BAD pcap / pcapng (ZPA on, failing)")
+        if not bad_file:
+            print("❌ No bad capture selected. Exiting.")
+            return
 
     print(f"\n  Good: {good_file}")
     print(f"  Bad:  {bad_file}")
