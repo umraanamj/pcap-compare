@@ -77,17 +77,83 @@ TSHARK_FIELDS = [
     "dns.flags.rcode",                      # 15 0 = ok, 3 = NXDOMAIN, etc.
     "udp.dstport",                          # 16 UDP dest port (non-TCP visibility)
     "ip.proto",                             # 17 IP protocol number (6=TCP,17=UDP…)
+    "icmp.type",                            # 18 ICMP type (3=unreachable, 11=TTL…)
+    "icmp.code",                            # 19 ICMP code (reason for unreachable)
+    "icmpv6.type",                          # 20 ICMPv6 type (1=unreach, 3=TTL)
+    "tls.alert_message.level",              # 21 2 = fatal TLS alert
+    "tls.alert_message.desc",               # 22 TLS alert description number
 ]
 
 # IP protocol numbers -> labels, for non-TCP flow reporting.
 _PROTO = {"1": "ICMP", "6": "TCP", "17": "UDP", "47": "GRE",
           "50": "ESP", "58": "ICMPv6"}
 
+_ICMP_UNREACH = {"0": "net unreachable", "1": "host unreachable",
+                 "2": "protocol unreachable", "3": "port unreachable",
+                 "9": "net admin-prohibited", "10": "host admin-prohibited",
+                 "13": "comm admin-filtered"}
+
+_TLS_ALERT = {"40": "handshake_failure", "42": "bad_certificate",
+              "43": "unsupported_certificate", "44": "certificate_revoked",
+              "45": "certificate_expired", "46": "certificate_unknown",
+              "48": "unknown_ca", "49": "access_denied", "51": "decrypt_error",
+              "70": "protocol_version", "80": "internal_error",
+              "112": "unrecognized_name"}
+
 
 def _proto_label(field):
     """Label the (innermost) IP protocol number from a tshark ip.proto field."""
     n = field.split(",")[-1].strip() if field else ""
     return _PROTO.get(n, ("proto-" + n) if n else "non-TCP")
+
+
+def _icmp_failure_label(itype, icode, i6type):
+    """Return a human label if this ICMP/ICMPv6 packet signals a failure, else None."""
+    t = itype.split(",")[0].strip() if itype else ""
+    c = icode.split(",")[0].strip() if icode else ""
+    t6 = i6type.split(",")[0].strip() if i6type else ""
+    if t == "3":
+        return "ICMP unreachable (%s)" % _ICMP_UNREACH.get(c, "code " + c)
+    if t == "11":
+        return "ICMP time-exceeded (TTL)"
+    if t6 == "1":
+        return "ICMPv6 destination-unreachable"
+    if t6 == "3":
+        return "ICMPv6 time-exceeded (TTL)"
+    return None
+
+
+# ----- terminal colour (green = success, red = failure) --------------------
+class _Palette:
+    def __init__(self):
+        self.on = False
+
+    def paint(self, code, s):
+        return f"\033[{code}m{s}\033[0m" if self.on else s
+
+
+CLR = _Palette()
+
+
+def _c_ok(s):    return CLR.paint("32", s)   # green
+def _c_fail(s):  return CLR.paint("31", s)   # red
+def _c_warn(s):  return CLR.paint("33", s)   # yellow
+def _c_bold(s):  return CLR.paint("1", s)
+
+
+def _c_outcome(oc):
+    return _c_ok(oc) if oc == "ok" else _c_fail(oc)
+
+
+def _setup_colors(enabled):
+    CLR.on = enabled
+    if enabled and sys.platform.startswith("win"):
+        try:  # turn on ANSI escape processing on modern Windows consoles
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
 
 # Vendors whose traffic we deliberately IGNORE for now (telemetry / CDN noise the
 # app doesn't depend on). Matched by FQDN suffix. Edit these lists to taste.
@@ -282,6 +348,8 @@ class StreamStat:
         self.server_bytes = 0   # payload bytes sent BY the server (proof it answered)
         self.sni = None
         self.host = None
+        self.tls_fatal = False  # a fatal TLS alert was seen on this stream
+        self.tls_alert = None   # human label of that alert
 
     def outcome(self):
         """ok | reset | no_response | half_open | unknown."""
@@ -335,6 +403,7 @@ def parse_capture(tshark, path):
     tunneled_rows = 0                # packets whose IP field held >1 IP (encap)
     tunneled_examples = []           # a few raw joined fields, for diagnostics
     nontcp_flows = Counter()         # (src, dst, dport, proto) -> count, non-TCP
+    icmp_failures = Counter()        # (src, dst, label) -> count
     total_packets = 0
 
     for line in proc.stdout.splitlines():
@@ -393,14 +462,25 @@ def parse_capture(tshark, path):
                     dns_failed.add(dns_name)
 
         # --- TCP stream bookkeeping -----------------------------------------
+        # An ICMP error embeds the original packet's headers, so tshark assigns it
+        # a tcp.stream — treat anything with an ICMP type as non-TCP regardless.
         stream_id = cols[1]
-        if stream_id == "":
+        is_icmp = bool(cols[18].strip()) or bool(cols[20].strip())
+        if stream_id == "" or is_icmp:
             # Non-TCP packet (UDP/ICMP/ESP/…). Record a coarse flow so the source
             # IP is still visible here even when it isn't doing TCP — mirrors what
             # Wireshark's `ip.addr == X` shows. DNS is handled above, so skip it.
             if ip_src and ip_dst and not dns_name:
-                proto = _proto_label(cols[17])
+                if is_icmp:
+                    proto = "ICMPv6" if cols[20].strip() else "ICMP"
+                else:
+                    proto = _proto_label(cols[17])
                 nontcp_flows[(ip_src, ip_dst, cols[16], proto)] += 1
+                # ICMP/ICMPv6 failure (unreachable / time-exceeded). For an ICMP
+                # error, the innermost IPs are the ORIGINAL src->dst that failed.
+                label = _icmp_failure_label(cols[18], cols[19], cols[20])
+                if label:
+                    icmp_failures[(ip_src, ip_dst, label)] += 1
             continue
         s = streams[stream_id]
         s.ips_seen.update(src_ips)
@@ -425,6 +505,9 @@ def parse_capture(tshark, path):
             s.sni = sni
         if host and not s.host:
             s.host = host
+        if cols[21] == "2":            # fatal TLS alert on this stream
+            s.tls_fatal = True
+            s.tls_alert = _TLS_ALERT.get(cols[22], "alert " + cols[22] if cols[22] else "fatal")
         # Server-origin payload = proof the far end actually responded with data.
         if s.server_ip and ip_src == s.server_ip and tcp_len > 0:
             s.server_bytes += tcp_len
@@ -460,6 +543,7 @@ def parse_capture(tshark, path):
         "tunneled_rows": tunneled_rows,
         "tunneled_examples": tunneled_examples,
         "nontcp_flows": nontcp_flows,
+        "icmp_failures": icmp_failures,
     }
 
 
@@ -619,22 +703,26 @@ def _source_ip_flows(prof, endpoint_ips):
             role, peer, fqdn = "IN", s.client_ip, None
         else:
             role, peer, fqdn = "VIA", s.server_ip, (s.sni or s.host)
-        key = (role, peer or "?", s.server_port or "?", oc, fqdn or "")
+        tls = ("TLS " + s.tls_alert) if s.tls_fatal else ""
+        key = (role, peer or "?", s.server_port or "?", oc, fqdn or "", tls)
         agg[key] = agg.get(key, 0) + 1
     return agg
 
 
 def _format_flows(agg, indent="      ", limit=None):
-    """Render aggregated source-IP flows as readable lines."""
+    """Render aggregated source-IP flows as readable, colour-coded lines."""
     arrow = {"OUT": "→", "IN": "←", "VIA": "↔"}
     items = sorted(agg.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
     shown = items if limit is None else items[:limit]
     lines = []
-    for (role, peer, port, oc, fqdn), count in shown:
+    for (role, peer, port, oc, fqdn, tls), count in shown:
         dest = f"{peer}:{port}"
         name = f"  ({fqdn})" if fqdn else ""
         times = f"  ×{count}" if count > 1 else ""
-        lines.append(f"{indent}{role:<3} {arrow[role]} {dest:<22} {oc}{name}{times}")
+        verdict = _c_outcome(oc)
+        if tls:
+            verdict += "  " + _c_fail(tls)        # fatal TLS alert => failure
+        lines.append(f"{indent}{role:<3} {arrow[role]} {dest:<22} {verdict}{name}{times}")
     if limit is not None and len(items) > limit:
         lines.append(f"{indent}… +{len(items) - limit} more flow group(s) — run with --debug")
     return lines
@@ -668,6 +756,30 @@ def _format_nontcp(agg, indent="      ", limit=None):
     if limit is not None and len(items) > limit:
         lines.append(f"{indent}… +{len(items) - limit} more — run with --debug")
     return lines
+
+
+def _collect_icmp_failures(captures_named, endpoint_ips):
+    """Gather ICMP/ICMPv6 failures involving an endpoint IP across captures.
+    captures_named: list of (label, profile). Returns sorted display rows."""
+    rows = {}
+    for label, prof in captures_named:
+        for (src, dst, why), count in prof.get("icmp_failures", {}).items():
+            if endpoint_ips and not ({src, dst} & endpoint_ips):
+                continue
+            rows[(label, src, dst, why)] = rows.get((label, src, dst, why), 0) + count
+    return sorted(rows.items())
+
+
+def _print_icmp_failures(rows):
+    if not rows:
+        return
+    print(f"\n{'=' * 60}")
+    print(_c_fail(f"🧊  ICMP FAILURES ({len(rows)})"))
+    print(f"{'=' * 60}")
+    print("  ICMP errors involving the source IP (unreachable / TTL exceeded):")
+    for (label, src, dst, why), count in rows:
+        times = f"  ×{count}" if count > 1 else ""
+        print(f"  • {src} → {dst}   {_c_fail(why)}{times}   [{label}]")
 
 
 def _inbound_failures(connectors, endpoint_ips):
@@ -775,6 +887,10 @@ def report(good, bad, connectors=None, src_override=None, debug=False):
 
     show_conn = bool(connectors) and connector_usable
     inbound = _inbound_failures(connectors, endpoint_ips) if (connectors and endpoint_ips) else {}
+    named_caps = [("GOOD", good), ("BAD", bad)]
+    named_caps += [(os.path.basename(p.get("path", "")) or "connector", p)
+                   for p in connectors]
+    icmp = _collect_icmp_failures(named_caps, endpoint_ips)
     _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ignored)
     _print_correlation(endpoint_ips, per_connector, bool(connectors),
                        connector_usable, bool(src_override))
@@ -782,6 +898,7 @@ def report(good, bad, connectors=None, src_override=None, debug=False):
     _print_reachable(reachable)
     _print_unnamed(missing)
     _print_inbound(inbound)
+    _print_icmp_failures(icmp)
 
 
 def _fmt_dest(d):
@@ -944,9 +1061,9 @@ def _print_missing(missing, has_connector):
     named.sort(key=lambda m: m[0]["fqdn"])
     for d, reason, trace in named:
         name, port, ips = _fmt_dest(d)
-        print(f"\n  • {name}:{port}")
+        print(f"\n  • {_c_bold(name + ':' + str(port))}")
         print(f"      real IP(s): {ips}")
-        print(f"      client side: {reason}")
+        print(f"      client side: {_c_fail(reason)}")
         if has_connector:
             print(f"      connector:   {trace or 'n/a'}")
     # Wildcard suggestions when several FQDNs share a parent domain.
@@ -969,7 +1086,7 @@ def _print_reachable(reachable):
     reachable.sort(key=lambda d: (d["fqdn"] or ""))
     for d in reachable:
         name, port, _ = _fmt_dest(d)
-        print(f"  • {name}:{port}")
+        print(f"  • {_c_ok(name + ':' + str(port))}")
 
 
 _INBOUND_LABEL = {
@@ -990,7 +1107,7 @@ def _print_inbound(agg):
     print("  source IP and the connection failed:")
     for (name, src, dst, port, oc), count in sorted(agg.items()):
         times = f"  (×{count})" if count > 1 else ""
-        print(f"  • {src} → {dst}:{port}   {_INBOUND_LABEL[oc]}{times}   [{name}]")
+        print(f"  • {src} → {dst}:{port}   {_c_fail(_INBOUND_LABEL[oc])}{times}   [{name}]")
 
 
 def _print_unnamed(missing):
@@ -1008,9 +1125,9 @@ def _print_unnamed(missing):
 
 
 def _parse_argv(argv):
-    """Parse --src IP / --src=IP (repeatable, comma-OK) and --debug.
-    Returns (src_list, debug_bool, positionals)."""
-    src, debug, positional, i = [], False, [], 0
+    """Parse --src IP / --src=IP (repeatable, comma-OK), --debug, --no-color.
+    Returns (src_list, debug_bool, no_color_bool, positionals)."""
+    src, debug, no_color, positional, i = [], False, False, [], 0
     while i < len(argv):
         a = argv[i]
         if a == "--src" and i + 1 < len(argv):
@@ -1025,10 +1142,14 @@ def _parse_argv(argv):
             debug = True
             i += 1
             continue
+        if a == "--no-color":
+            no_color = True
+            i += 1
+            continue
         if not a.startswith("-"):
             positional.append(a)
         i += 1
-    return src, debug, positional
+    return src, debug, no_color, positional
 
 
 def main():
@@ -1046,7 +1167,9 @@ def main():
         sys.exit(1)
 
     conn_files = []
-    src_override, debug, args = _parse_argv(sys.argv[1:])
+    src_override, debug, no_color, args = _parse_argv(sys.argv[1:])
+    _setup_colors(not no_color and sys.stdout.isatty()
+                  and os.environ.get("NO_COLOR") is None)
     if len(args) >= 2:
         # CLI mode: pcap_compare.py [--src IP] GOOD BAD [CONNECTOR ...]
         good_file, bad_file = args[0], args[1]

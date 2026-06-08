@@ -76,6 +76,23 @@ non-TCP traffic, those flows are listed (direction, peer:port, protocol, count)
 instead of the connector being reported as "not seen" — so a UDP/DTLS tunnel no
 longer looks like a miss.
 
+**ICMP failures** are pulled out into their own section — `destination
+unreachable` (with the reason: host / port / admin-prohibited …) and
+`time-exceeded` (TTL). ICMP errors embed the original packet, so the script
+reads the *inner* src→dst to show exactly which connection the ICMP error was
+about (e.g. `10.6.0.2 → 5.6.7.8  ICMP unreachable (host unreachable)`).
+
+**TLS fatal alerts** are flagged on a flow even when TCP succeeded — a `handshake_failure`
+/ `unknown_ca` / `certificate_unknown` means the endpoint reached the server but
+the TLS layer was rejected (cert pinning, inspection, etc.).
+
+### Colour
+
+Successful connections are **green**, failures are **red** (outcomes, the
+reachable/missing lists, inbound and ICMP failures). Colour auto-enables on a
+terminal and turns off when piped/redirected, when `NO_COLOR` is set, or with
+`--no-color`. On Windows it enables ANSI on the console automatically.
+
 Both directions are considered. The break-point trace covers the source IP
 **reaching app servers**; separately, an **inbound-failures** section reports
 flows in the connector capture(s) where something is trying to **reach the source
