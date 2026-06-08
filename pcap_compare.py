@@ -68,13 +68,18 @@ TSHARK_FIELDS = [
 
 
 def find_tshark():
-    """Locate tshark on PATH or in the standard macOS Wireshark.app location."""
-    path = shutil.which("tshark")
+    """Locate tshark on PATH or in a standard Wireshark install (macOS/Windows)."""
+    path = shutil.which("tshark") or shutil.which("tshark.exe")
     if path:
         return path
-    mac_default = "/Applications/Wireshark.app/Contents/MacOS/tshark"
-    if os.path.exists(mac_default):
-        return mac_default
+    # Wireshark is often not on PATH, especially on Windows. Check the usual spots.
+    for candidate in (
+        "/Applications/Wireshark.app/Contents/MacOS/tshark",   # macOS
+        r"C:\Program Files\Wireshark\tshark.exe",              # Windows 64-bit
+        r"C:\Program Files (x86)\Wireshark\tshark.exe",        # Windows 32-bit
+    ):
+        if os.path.exists(candidate):
+            return candidate
     return None
 
 
@@ -455,8 +460,9 @@ def main():
     if not tshark:
         print(
             "\n❌ tshark not found. Install Wireshark, then re-run.\n"
-            "   macOS:  brew install --cask wireshark\n"
-            "   (tshark ships inside Wireshark.app/Contents/MacOS/)"
+            "   macOS:    brew install --cask wireshark\n"
+            "   Windows:  install from https://www.wireshark.org/download.html\n"
+            "             (tshark.exe lands in C:\\Program Files\\Wireshark\\)"
         )
         sys.exit(1)
 
