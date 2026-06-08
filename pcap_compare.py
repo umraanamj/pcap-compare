@@ -338,10 +338,13 @@ def parse_capture(tshark, path):
             tunneled_rows += 1
             if len(tunneled_examples) < 5:
                 tunneled_examples.append(f"{cols[2]} -> {cols[3]}")
-        # Primary src/dst (first listed = outermost) for the existing stream logic;
-        # ips_seen below captures ALL of them so matching works under encapsulation.
-        ip_src = src_ips[0] if src_ips else ""
-        ip_dst = dst_ips[0] if dst_ips else ""
+        # Primary src/dst = the INNERMOST IP. tshark lists encapsulated IPs
+        # outer-first, inner-last, and for a tunnelled capture the inner packet
+        # (endpoint -> app server) is the real conversation we want to analyze —
+        # not the outer tunnel endpoints. ips_seen below keeps ALL layers so the
+        # source IP still matches whether it's inner or outer.
+        ip_src = src_ips[-1] if src_ips else ""
+        ip_dst = dst_ips[-1] if dst_ips else ""
         dstport = cols[4]
         for ip in src_ips:
             all_src_counts[ip] += 1
@@ -571,6 +574,52 @@ def _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip):
     return "reached the App Connector, outcome unclear there"
 
 
+def _source_ip_flows(prof, endpoint_ips):
+    """
+    Every TCP stream that involves one of the endpoint IPs, aggregated into
+    (role, peer_ip, port, outcome, fqdn) -> count.
+
+    role:  OUT = the endpoint IP initiates (it's the SYN source)
+           IN  = something targets the endpoint IP (it's the SYN destination)
+           VIA = the endpoint IP only appears as an encapsulation layer
+                 (neither the inner client nor the inner server)
+    """
+    agg = {}
+    for s in prof["streams"].values():
+        if not (s.ips_seen & endpoint_ips):
+            continue
+        oc = s.outcome()
+        if s.client_ip in endpoint_ips:
+            role, peer = "OUT", s.server_ip
+            fqdn = s.sni or s.host
+            if not fqdn and s.server_ip:
+                names = prof["ip_fqdn"].get(s.server_ip)
+                fqdn = sorted(names)[0] if names else None
+        elif s.server_ip in endpoint_ips:
+            role, peer, fqdn = "IN", s.client_ip, None
+        else:
+            role, peer, fqdn = "VIA", s.server_ip, (s.sni or s.host)
+        key = (role, peer or "?", s.server_port or "?", oc, fqdn or "")
+        agg[key] = agg.get(key, 0) + 1
+    return agg
+
+
+def _format_flows(agg, indent="      ", limit=None):
+    """Render aggregated source-IP flows as readable lines."""
+    arrow = {"OUT": "→", "IN": "←", "VIA": "↔"}
+    items = sorted(agg.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
+    shown = items if limit is None else items[:limit]
+    lines = []
+    for (role, peer, port, oc, fqdn), count in shown:
+        dest = f"{peer}:{port}"
+        name = f"  ({fqdn})" if fqdn else ""
+        times = f"  ×{count}" if count > 1 else ""
+        lines.append(f"{indent}{role:<3} {arrow[role]} {dest:<22} {oc}{name}{times}")
+    if limit is not None and len(items) > limit:
+        lines.append(f"{indent}… +{len(items) - limit} more flow group(s) — run with --debug")
+    return lines
+
+
 def _inbound_failures(connectors, endpoint_ips):
     """
     Connector flows where something is trying to REACH an endpoint source IP
@@ -726,6 +775,15 @@ def _print_debug(good, bad, connectors, endpoint_ips):
             flag = "✓ present" if (as_src or as_dst) else "✗ NOT in this capture"
             print(f"    → {ip}: as-src={as_src} as-dst={as_dst} "
                   f"in {ntcp} TCP stream(s)   {flag}")
+            if as_src and not ntcp:
+                print("        (seen in packets but in NO TCP stream — likely "
+                      "UDP/QUIC, which TCP outcome analysis can't classify)")
+        flows = _source_ip_flows(prof, endpoint_ips)
+        if flows:
+            print(f"    flows involving the source IP ({sum(flows.values())} "
+                  f"stream(s), {len(flows)} group(s)):")
+            for ln in _format_flows(flows, indent="      ", limit=60):
+                print(ln)
 
 
 def _print_ignore_banner():
@@ -780,6 +838,9 @@ def _print_correlation(endpoint_ips, per_connector, has_connector,
         if matched > 0:
             print(f"    • {name}: {matched} flow(s) involving the source IP "
                   f"→ {len(dests)} destination(s) analyzed.")
+            flows = _source_ip_flows(prof, endpoint_ips)
+            for ln in _format_flows(flows, indent="        ", limit=12):
+                print(ln)
         else:
             print(f"    • {name}: source IP NOT seen here — nothing to analyze "
                   "(App Connector may NAT the client, or wrong capture).")

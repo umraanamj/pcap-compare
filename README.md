@@ -57,6 +57,18 @@ with a warning. Override the auto-detected IP with `--src IP` (repeatable, or
 comma-separated) — e.g. when the connector sees a ZPA-assigned source IP that
 differs from the endpoint's local IP.
 
+For every connector that matches the source IP, the output now lists the actual
+**flows it found** — direction (`OUT` the IP initiates, `IN` something targets
+it, `VIA` it's only a tunnel layer), peer, port, outcome, and FQDN — so you can
+triangulate exactly what that IP is doing in each pcap. `--debug` shows the full
+per-capture flow list.
+
+**Tunnelled / encapsulated captures:** if a pcap carries the inner endpoint→app
+packet inside an outer tunnel, tshark reports both IPs in one field (outer first,
+inner last). The script uses the **inner** IP as the real source/destination
+(the conversation you care about), keeps every layer for matching, and `--debug`
+flags the encapsulation with examples.
+
 Both directions are considered. The break-point trace covers the source IP
 **reaching app servers**; separately, an **inbound-failures** section reports
 flows in the connector capture(s) where something is trying to **reach the source
