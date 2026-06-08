@@ -5,25 +5,48 @@ A small Python tool that finds the IPs/FQDNs an application needs that are
 
 ZPA Network Presence only lets an app reach the exact destinations listed in its
 Application Segment. App owners rarely know the full list, so connections to
-anything missing just fail. This tool finds the gaps by comparing two captures:
+anything missing just fail. This tool finds the gaps by comparing captures:
 
 | Capture | Taken with | Role |
 |---------|-----------|------|
-| **GOOD** | In the office, **ZPA / VPN OFF** (full connectivity) | Ground truth of every destination the app uses |
-| **BAD**  | **ZPA / Network Presence ON** (failing) | Only reaches what's already in the segment |
+| **GOOD** endpoint | In the office, **ZPA / VPN OFF** (full connectivity) | Ground truth of every destination the app uses |
+| **BAD** endpoint  | **ZPA / Network Presence ON** (failing) | Only reaches what's already in the segment |
+| **App Connector** *(optional)* | At the **network connector** that brokers the conversation | Pinpoints *where* a failing flow breaks |
 
 It enumerates every destination the app talks to in the GOOD capture, then
 reports which ones **fail or never appear** in the BAD capture — i.e. the
 IPs/FQDNs you need to add to the Application Segment.
 
+### Adding the App Connector capture (where does it break?)
+
+ZPA tunnel traffic has two halves: the **endpoint** (Client Connector) and the
+**App Connector** (the network connector that brokers the session). The data path
+is `Client → ZPA Service Edge → App Connector → app server`. Capture at the App
+Connector ([Zscaler: how to PCAP an App Connector](https://help.zscaler.com/zpa/troubleshooting-app-connectors))
+and pass it as a third input, and for every failing destination the tool says
+which side of the broker the flow died on:
+
+- **never reached the App Connector** → broker didn't route it (Network Presence
+  / App Segment doesn't cover the destination).
+- **reached the connector, but the server gave no SYN-ACK / reset** → the app is
+  unreachable *behind* the connector (firewall / routing / app down).
+- **App Connector reached the server fine** → the break is between the client and
+  the connector (broker / return path), not the app.
+
+The App Connector source-NATs the client, so flows are correlated by
+**destination** (FQDN/IP+port) — and because the connector dials the **real**
+server IPs (the same ones in the GOOD capture), they line up cleanly across the
+NAT. The client source IP is still extracted and shown.
+
 ## Usage
 
 ```bash
-# Interactive: pops a file picker for the GOOD capture, then the BAD capture
+# Interactive: file picker for GOOD, then BAD, then an optional App Connector
 python3 pcap_compare.py
 
-# Or pass the two captures directly (no dialogs)
+# Or pass captures directly (the connector is optional)
 python3 pcap_compare.py GOOD.pcap BAD.pcap
+python3 pcap_compare.py GOOD.pcap BAD.pcap CONNECTOR.pcap
 ```
 
 Works with `.pcap` and `.pcapng` (tshark autodetects).

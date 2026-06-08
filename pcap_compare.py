@@ -8,21 +8,27 @@ ZPA Network Presence only lets an app reach the exact IPs / FQDNs you've listed
 in its Application Segment. App owners rarely know the full list, so connections
 to anything missing just fail. This script finds what's missing.
 
-  GOOD capture = taken in the office with ZPA / VPN OFF (full connectivity).
-                 This is the GROUND TRUTH of every destination the app uses.
-  BAD  capture = taken with ZPA / Network Presence ON. The app can only reach
-                 what's already in the segment, so the gaps show up as failures.
+  GOOD endpoint capture = taken in the office with ZPA / VPN OFF (full
+                 connectivity). GROUND TRUTH of every destination the app uses.
+  BAD  endpoint capture = taken with ZPA / Network Presence ON. The app can only
+                 reach what's in the segment, so the gaps show up as failures.
+  App Connector capture (OPTIONAL) = taken at the network connector that brokers
+                 the conversation (Client -> Service Edge -> App Connector ->
+                 server). Lets the tool say WHERE a flow breaks: before the
+                 connector (broker / Network Presence) or behind it (app side).
 
 The script enumerates every destination the app talks to in the GOOD capture,
 then reports which ones FAIL or never appear in the BAD capture — i.e. the
-IPs/FQDNs you need to add to the Application Segment.
+IPs/FQDNs you need to add to the Application Segment. With a connector capture it
+also traces each failing flow to a break point.
 
-Launch flow: a file picker for the GOOD capture, then the BAD capture. On macOS
-the picker is the native dialog (osascript) so no tkinter is needed; other
-platforms use tkinter, falling back to a terminal prompt. You can also pass the
-two files on the command line:
+Launch flow: a file picker for the GOOD capture, the BAD capture, then an
+OPTIONAL App Connector capture (cancel to skip). On macOS the picker is the
+native dialog (osascript) so no tkinter is needed; other platforms use tkinter,
+falling back to a terminal prompt. You can also pass the files on the command
+line (the connector is optional):
 
-    python3 pcap_compare.py GOOD.pcap BAD.pcap
+    python3 pcap_compare.py GOOD.pcap BAD.pcap [CONNECTOR.pcap]
 
 Works with .pcap and .pcapng (tshark autodetects).
 
@@ -35,6 +41,11 @@ Key design choices
   * Two failure modes are distinguished in the BAD capture:
       - DNS never resolves the name      -> ZPA doesn't know the FQDN at all
       - resolves but SYN gets no SYN-ACK  -> not covered by the segment / blocked
+  * The App Connector source-NATs the client, so connector flows are correlated
+    by DESTINATION too — and the connector talks to the REAL server IPs, the same
+    ones seen in the GOOD capture, so IP matching lines up across the broker. The
+    client source IP is still extracted and shown (and used if it happens to be
+    preserved at the connector).
 
 Requires Wireshark's `tshark` on PATH (or in the macOS Wireshark.app bundle).
   macOS:  brew install --cask wireshark
@@ -44,7 +55,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 # Single-pass tshark field list. Order maps to the indices used in parse_capture.
 TSHARK_FIELDS = [
@@ -162,6 +173,7 @@ class StreamStat:
     """Per-TCP-stream rollup used to decide if a connection succeeded."""
 
     def __init__(self):
+        self.client_ip = None   # source of the SYN — the endpoint making the request
         self.server_ip = None
         self.server_port = None
         self.syn = False
@@ -259,6 +271,7 @@ def parse_capture(tshark, path):
         # Identify the server from the SYN (syn & !ack -> dst is the server).
         if syn and not ack:
             s.syn = True
+            s.client_ip = ip_src
             s.server_ip = ip_dst
             s.server_port = dstport
         if syn and ack:
@@ -288,6 +301,10 @@ def parse_capture(tshark, path):
         for ip in ips:
             ip_fqdn[ip].add(fqdn)
 
+    # Source IPs that originated connections (the endpoints making requests).
+    client_ips = Counter(s.client_ip for s in streams.values() if s.client_ip)
+    all_src_ips = set(client_ips)
+
     return {
         "path": path,
         "total_packets": total_packets,
@@ -297,6 +314,8 @@ def parse_capture(tshark, path):
         "dns_failed": dns_failed,
         "dns_queried": dns_queried,
         "ip_fqdn": dict(ip_fqdn),
+        "client_ips": client_ips,      # Counter: src IP -> #connections initiated
+        "all_src_ips": all_src_ips,    # every source IP seen originating a SYN
     }
 
 
@@ -344,18 +363,68 @@ def _parent_domain(fqdn):
     return ".".join(parts[-2:])
 
 
-def report(good, bad):
+def _index_dests(dests):
+    """Index a destination set by (fqdn, port) and (ip, port) for fast lookup."""
+    by_fqdn, by_ip = {}, {}
+    for (_, port), d in dests.items():
+        if d["fqdn"]:
+            by_fqdn[(d["fqdn"], port)] = d
+        for ip in d["ips"]:
+            by_ip[(ip, port)] = d
+    return by_fqdn, by_ip
+
+
+def _lookup_dest(d, by_fqdn, by_ip):
+    """Find this destination in another capture, by FQDN first then by IP."""
+    if d["fqdn"]:
+        hit = by_fqdn.get((d["fqdn"], d["port"]))
+        if hit:
+            return hit
+    for ip in d["ips"]:
+        if (ip, d["port"]) in by_ip:
+            return by_ip[(ip, d["port"])]
+    return None
+
+
+def _connector_trace(d, connector, conn_by_fqdn, conn_by_ip):
+    """
+    Given a destination that failed for the client, say where it broke relative
+    to the App Connector. Returns a one-line trace string, or None if unknown.
+
+    The App Connector source-NATs the client, so we correlate by DESTINATION
+    (FQDN/IP+port) — the same key the connection uses on both sides of the broker.
+    """
+    conn_d = _lookup_dest(d, conn_by_fqdn, conn_by_ip)
+    if conn_d is None:
+        # The connector never even tried this destination.
+        if d["fqdn"] and d["fqdn"] in connector.get("dns_failed", set()):
+            return ("App Connector tried to resolve it and DNS FAILED there "
+                    "→ fix DNS at the connector / app side")
+        return ("never reached the App Connector → broker didn't route it "
+                "(Network Presence / App Segment doesn't cover this destination)")
+    if conn_d["outcome"] == "ok":
+        return ("App Connector reached the server FINE → the break is between "
+                "the client and the connector (broker / return path), not the app")
+    if conn_d["outcome"] == "no_response":
+        return ("reached the App Connector, but the server gave NO SYN-ACK to "
+                "the connector → app unreachable behind the connector "
+                "(firewall / routing / app down)")
+    if conn_d["outcome"] == "reset":
+        return ("reached the App Connector, but the server RESET it → app-side "
+                "block behind the connector")
+    if conn_d["outcome"] == "half_open":
+        return ("reached the App Connector, connected but server sent no data "
+                "→ app-side issue behind the connector")
+    return "reached the App Connector, outcome unclear there"
+
+
+def report(good, bad, connector=None):
     good_dests = build_destinations(good)
     bad_dests = build_destinations(bad)
+    bad_by_fqdn, bad_by_ip = _index_dests(bad_dests)
 
-    # Index BAD destinations by fqdn:port and ip:port for lookups.
-    bad_by_fqdn = {}
-    bad_by_ip = {}
-    for (_, port), d in bad_dests.items():
-        if d["fqdn"]:
-            bad_by_fqdn[(d["fqdn"], port)] = d
-        for ip in d["ips"]:
-            bad_by_ip[(ip, port)] = d
+    conn_dests = build_destinations(connector) if connector else {}
+    conn_by_fqdn, conn_by_ip = _index_dests(conn_dests) if connector else ({}, {})
 
     # Required = destinations the app actually used successfully in the office.
     required = {k: d for k, d in good_dests.items() if d["outcome"] == "ok"}
@@ -363,41 +432,39 @@ def report(good, bad):
     reachable, missing = [], []
     for (_, port), d in required.items():
         fqdn = d["fqdn"]
-        bad_d = None
-        if fqdn:
-            bad_d = bad_by_fqdn.get((fqdn, port))
-        if bad_d is None:
-            for ip in d["ips"]:
-                if (ip, port) in bad_by_ip:
-                    bad_d = bad_by_ip[(ip, port)]
-                    break
+        bad_d = _lookup_dest(d, bad_by_fqdn, bad_by_ip)
 
         if bad_d and bad_d["outcome"] == "ok":
             reachable.append(d)
             continue
 
-        # Work out WHY it's failing in the bad capture.
+        # Work out WHY it's failing for the client (endpoint side).
         if fqdn and fqdn not in bad["dns_resolved"]:
             if fqdn in bad["dns_failed"]:
-                reason = "DNS lookup FAILED in ZPA (NXDOMAIN / no answer)"
+                reason = "DNS lookup FAILED via Network Presence (NXDOMAIN / no answer)"
             elif fqdn in bad["dns_queried"]:
-                reason = "DNS queried but never resolved through ZPA"
+                reason = "DNS queried but never resolved via Network Presence"
             else:
                 reason = "never reached — DNS not even attempted (app gave up)"
         elif bad_d is None:
             reason = "resolved, but the app never connected (no SYN to it)"
         elif bad_d["outcome"] == "no_response":
-            reason = "TCP SYN sent but got NO SYN-ACK (blocked by segment)"
+            reason = "TCP SYN sent but got NO SYN-ACK (not covered by segment)"
         elif bad_d["outcome"] == "reset":
-            reason = "connection RESET before data (blocked by segment)"
+            reason = "connection RESET before data (not covered by segment)"
         elif bad_d["outcome"] == "half_open":
             reason = "connected but server sent no data (likely blocked)"
         else:
             reason = "did not complete in the bad capture"
-        missing.append((d, reason))
 
-    _print_summary(good, bad, good_dests, bad_dests, required)
-    _print_missing(missing)
+        trace = None
+        if connector:
+            trace = _connector_trace(d, connector, conn_by_fqdn, conn_by_ip)
+        missing.append((d, reason, trace))
+
+    _print_summary(good, bad, connector, good_dests, bad_dests, conn_dests, required)
+    _print_source_ips(bad, connector)
+    _print_missing(missing, bool(connector))
     _print_reachable(reachable)
     _print_unnamed(missing)
 
@@ -409,12 +476,15 @@ def _fmt_dest(d):
     return name, d["port"], f"{ips}{more}"
 
 
-def _print_summary(good, bad, good_dests, bad_dests, required):
+def _print_summary(good, bad, connector, good_dests, bad_dests, conn_dests, required):
     print(f"\n{'=' * 60}")
     print("📊  CAPTURE SUMMARY")
     print(f"{'=' * 60}")
-    for label, prof, dests in (("GOOD (office, ZPA off)", good, good_dests),
-                               ("BAD  (ZPA on)", bad, bad_dests)):
+    rows = [("GOOD endpoint (office, ZPA off)", good, good_dests),
+            ("BAD  endpoint (ZPA on)", bad, bad_dests)]
+    if connector:
+        rows.append(("App Connector (network connector)", connector, conn_dests))
+    for label, prof, dests in rows:
         ok = sum(1 for d in dests.values() if d["outcome"] == "ok")
         print(f"\n  {label}")
         print(f"    packets ............. {prof['total_packets']}")
@@ -424,25 +494,48 @@ def _print_summary(good, bad, good_dests, bad_dests, required):
     print(f"\n  → App uses {len(required)} working destination(s) in the office.")
 
 
-def _print_missing(missing):
+def _print_source_ips(bad, connector):
+    """Show the endpoint's source IP(s) and whether they survive to the connector."""
+    src = bad.get("client_ips")
+    if not src:
+        return
+    top = src.most_common(5)
+    pretty = ", ".join(f"{ip} ({n})" for ip, n in top)
+    print(f"\n  Endpoint source IP(s) in the BAD capture: {pretty}")
+    if connector:
+        conn_src = connector.get("all_src_ips", set())
+        preserved = [ip for ip, _ in top if ip in conn_src]
+        if preserved:
+            print(f"    These same source IP(s) appear at the connector "
+                  f"({', '.join(preserved)}) — source is preserved, not NAT'd.")
+        else:
+            print("    None of these appear as a source at the connector — the "
+                  "App Connector source-NATs the client, so flows below are\n"
+                  "    correlated by DESTINATION (FQDN/IP+port), which is reliable "
+                  "across the NAT.")
+
+
+def _print_missing(missing, has_connector):
     print(f"\n{'=' * 60}")
     print(f"🚫  MISSING FROM NETWORK PRESENCE  —  add these ({len(missing)})")
     print(f"{'=' * 60}")
     if not missing:
         print("\n  Nothing missing — every destination the app used in the office")
-        print("  was also reachable with ZPA on. Coverage looks complete. ✅")
+        print("  was also reachable with Network Presence on. Coverage looks complete. ✅")
         return
     # FQDN-named first (these are what you add to the App Segment).
-    named = [(d, r) for d, r in missing if d["fqdn"]]
-    named.sort(key=lambda x: x[0]["fqdn"])
-    for d, reason in named:
+    named = [m for m in missing if m[0]["fqdn"]]
+    named.sort(key=lambda m: m[0]["fqdn"])
+    for d, reason, trace in named:
         name, port, ips = _fmt_dest(d)
         print(f"\n  • {name}:{port}")
         print(f"      real IP(s): {ips}")
-        print(f"      why it fails: {reason}")
+        print(f"      client side: {reason}")
+        if has_connector:
+            print(f"      connector:   {trace or 'n/a'}")
     # Wildcard suggestions when several FQDNs share a parent domain.
     parents = defaultdict(set)
-    for d, _ in named:
+    for d, _, _ in named:
         parents[_parent_domain(d["fqdn"])].add(d["fqdn"])
     wildcards = {p: names for p, names in parents.items() if len(names) > 1}
     if wildcards:
@@ -455,7 +548,7 @@ def _print_reachable(reachable):
     if not reachable:
         return
     print(f"\n{'=' * 60}")
-    print(f"🟢  ALREADY REACHABLE THROUGH ZPA ({len(reachable)})")
+    print(f"🟢  REACHABLE VIA NETWORK PRESENCE ({len(reachable)})")
     print(f"{'=' * 60}")
     reachable.sort(key=lambda d: (d["fqdn"] or ""))
     for d in reachable:
@@ -464,7 +557,7 @@ def _print_reachable(reachable):
 
 
 def _print_unnamed(missing):
-    unnamed = [d for d, _ in missing if not d["fqdn"]]
+    unnamed = [m[0] for m in missing if not m[0]["fqdn"]]
     if not unnamed:
         return
     print(f"\n{'=' * 60}")
@@ -491,42 +584,53 @@ def main():
         )
         sys.exit(1)
 
+    conn_file = None
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if len(args) == 2:
-        # CLI mode: python3 pcap_compare.py GOOD.pcap BAD.pcap
-        good_file, bad_file = args
-        for label, f in (("GOOD", good_file), ("BAD", bad_file)):
+    if len(args) in (2, 3):
+        # CLI mode: pcap_compare.py GOOD BAD [CONNECTOR]
+        good_file, bad_file = args[0], args[1]
+        conn_file = args[2] if len(args) == 3 else None
+        checks = [("GOOD", good_file), ("BAD", bad_file)]
+        if conn_file:
+            checks.append(("CONNECTOR", conn_file))
+        for label, f in checks:
             if not os.path.isfile(f):
                 print(f"❌ {label} capture not found: {f}")
                 sys.exit(1)
     elif args:
-        print("Usage: pcap_compare.py [GOOD.pcap BAD.pcap]   (no args = file pickers)")
+        print("Usage: pcap_compare.py [GOOD BAD [CONNECTOR]]   (no args = file pickers)")
         sys.exit(1)
     else:
-        print("\n📂 Select the GOOD capture — office, ZPA/VPN OFF (full access)…")
-        good_file = select_pcap_file("Select GOOD pcap / pcapng (ZPA off, working)")
+        print("\n📂 Select the GOOD endpoint capture — office, ZPA/VPN OFF…")
+        good_file = select_pcap_file("Select GOOD endpoint pcap (ZPA off, working)")
         if not good_file:
             print("❌ No good capture selected. Exiting.")
             return
 
-        print("📂 Select the BAD capture — ZPA / Network Presence ON (failing)…")
-        bad_file = select_pcap_file("Select BAD pcap / pcapng (ZPA on, failing)")
+        print("📂 Select the BAD endpoint capture — ZPA / Network Presence ON…")
+        bad_file = select_pcap_file("Select BAD endpoint pcap (ZPA on, failing)")
         if not bad_file:
             print("❌ No bad capture selected. Exiting.")
             return
 
-    print(f"\n  Good: {good_file}")
-    print(f"  Bad:  {bad_file}")
+        print("📂 (Optional) Select the App Connector capture — cancel to skip…")
+        conn_file = select_pcap_file("Select App Connector pcap (optional — cancel to skip)")
+
+    print(f"\n  Good endpoint: {good_file}")
+    print(f"  Bad endpoint:  {bad_file}")
+    if conn_file:
+        print(f"  App Connector: {conn_file}")
     print("\n⏳ Analyzing with tshark…")
 
     try:
         good = parse_capture(tshark, good_file)
         bad = parse_capture(tshark, bad_file)
+        connector = parse_capture(tshark, conn_file) if conn_file else None
     except RuntimeError as e:
         print(f"\n❌ {e}")
         sys.exit(1)
 
-    report(good, bad)
+    report(good, bad, connector)
     print()
 
 
