@@ -69,6 +69,13 @@ inner last). The script uses the **inner** IP as the real source/destination
 (the conversation you care about), keeps every layer for matching, and `--debug`
 flags the encapsulation with examples.
 
+**Non-TCP traffic (UDP / ICMP / DTLS / QUIC):** TCP break-point outcomes only
+apply to TCP, but the source IP is matched across **all** protocols (the same as
+Wireshark's `ip.addr == X`). If a connector carries the source IP only in
+non-TCP traffic, those flows are listed (direction, peer:port, protocol, count)
+instead of the connector being reported as "not seen" — so a UDP/DTLS tunnel no
+longer looks like a miss.
+
 Both directions are considered. The break-point trace covers the source IP
 **reaching app servers**; separately, an **inbound-failures** section reports
 flows in the connector capture(s) where something is trying to **reach the source

@@ -75,7 +75,19 @@ TSHARK_FIELDS = [
     "dns.a",                                # 13 A answers (comma-joined)
     "dns.aaaa",                             # 14 AAAA answers
     "dns.flags.rcode",                      # 15 0 = ok, 3 = NXDOMAIN, etc.
+    "udp.dstport",                          # 16 UDP dest port (non-TCP visibility)
+    "ip.proto",                             # 17 IP protocol number (6=TCP,17=UDP…)
 ]
+
+# IP protocol numbers -> labels, for non-TCP flow reporting.
+_PROTO = {"1": "ICMP", "6": "TCP", "17": "UDP", "47": "GRE",
+          "50": "ESP", "58": "ICMPv6"}
+
+
+def _proto_label(field):
+    """Label the (innermost) IP protocol number from a tshark ip.proto field."""
+    n = field.split(",")[-1].strip() if field else ""
+    return _PROTO.get(n, ("proto-" + n) if n else "non-TCP")
 
 # Vendors whose traffic we deliberately IGNORE for now (telemetry / CDN noise the
 # app doesn't depend on). Matched by FQDN suffix. Edit these lists to taste.
@@ -322,6 +334,7 @@ def parse_capture(tshark, path):
     all_dst_counts = Counter()       # every packet's IP destination (incl. UDP)
     tunneled_rows = 0                # packets whose IP field held >1 IP (encap)
     tunneled_examples = []           # a few raw joined fields, for diagnostics
+    nontcp_flows = Counter()         # (src, dst, dport, proto) -> count, non-TCP
     total_packets = 0
 
     for line in proc.stdout.splitlines():
@@ -382,6 +395,12 @@ def parse_capture(tshark, path):
         # --- TCP stream bookkeeping -----------------------------------------
         stream_id = cols[1]
         if stream_id == "":
+            # Non-TCP packet (UDP/ICMP/ESP/…). Record a coarse flow so the source
+            # IP is still visible here even when it isn't doing TCP — mirrors what
+            # Wireshark's `ip.addr == X` shows. DNS is handled above, so skip it.
+            if ip_src and ip_dst and not dns_name:
+                proto = _proto_label(cols[17])
+                nontcp_flows[(ip_src, ip_dst, cols[16], proto)] += 1
             continue
         s = streams[stream_id]
         s.ips_seen.update(src_ips)
@@ -440,6 +459,7 @@ def parse_capture(tshark, path):
         "all_dst_counts": all_dst_counts,  # per-packet IP destination counts
         "tunneled_rows": tunneled_rows,
         "tunneled_examples": tunneled_examples,
+        "nontcp_flows": nontcp_flows,
     }
 
 
@@ -620,6 +640,36 @@ def _format_flows(agg, indent="      ", limit=None):
     return lines
 
 
+def _nontcp_flows_for(prof, endpoint_ips):
+    """Non-TCP (UDP/ICMP/…) flows that involve an endpoint IP, aggregated to
+    (role, peer, dport, proto) -> count. role OUT = endpoint is the source."""
+    agg = {}
+    for (src, dst, dport, proto), count in prof.get("nontcp_flows", {}).items():
+        if src in endpoint_ips:
+            role, peer = "OUT", dst
+        elif dst in endpoint_ips:
+            role, peer = "IN", src
+        else:
+            continue
+        key = (role, peer, dport, proto)
+        agg[key] = agg.get(key, 0) + count
+    return agg
+
+
+def _format_nontcp(agg, indent="      ", limit=None):
+    """Render aggregated non-TCP source-IP flows."""
+    arrow = {"OUT": "→", "IN": "←"}
+    items = sorted(agg.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
+    shown = items if limit is None else items[:limit]
+    lines = []
+    for (role, peer, dport, proto), count in shown:
+        dest = f"{peer}:{dport}" if dport else peer
+        lines.append(f"{indent}{role:<3} {arrow[role]} {dest:<22} {proto}  ×{count}")
+    if limit is not None and len(items) > limit:
+        lines.append(f"{indent}… +{len(items) - limit} more — run with --debug")
+    return lines
+
+
 def _inbound_failures(connectors, endpoint_ips):
     """
     Connector flows where something is trying to REACH an endpoint source IP
@@ -775,14 +825,20 @@ def _print_debug(good, bad, connectors, endpoint_ips):
             flag = "✓ present" if (as_src or as_dst) else "✗ NOT in this capture"
             print(f"    → {ip}: as-src={as_src} as-dst={as_dst} "
                   f"in {ntcp} TCP stream(s)   {flag}")
-            if as_src and not ntcp:
-                print("        (seen in packets but in NO TCP stream — likely "
-                      "UDP/QUIC, which TCP outcome analysis can't classify)")
+            if (as_src or as_dst) and not ntcp:
+                print("        (present in packets but NO TCP stream — it's "
+                      "UDP/ICMP, see non-TCP flows below)")
         flows = _source_ip_flows(prof, endpoint_ips)
         if flows:
-            print(f"    flows involving the source IP ({sum(flows.values())} "
+            print(f"    TCP flows involving the source IP ({sum(flows.values())} "
                   f"stream(s), {len(flows)} group(s)):")
             for ln in _format_flows(flows, indent="      ", limit=60):
+                print(ln)
+        nontcp = _nontcp_flows_for(prof, endpoint_ips)
+        if nontcp:
+            print(f"    non-TCP flows involving the source IP "
+                  f"({sum(nontcp.values())} packet(s), {len(nontcp)} group(s)):")
+            for ln in _format_nontcp(nontcp, indent="      ", limit=60):
                 print(ln)
 
 
@@ -833,24 +889,46 @@ def _print_correlation(endpoint_ips, per_connector, has_connector,
     if not has_connector:
         return
     print("  Connector pcaps analyzed for that IP as source/destination:")
+    present_anywhere = False
     for prof, dests, matched in per_connector:
         name = os.path.basename(prof.get("path", "")) or "connector"
+        nontcp = _nontcp_flows_for(prof, endpoint_ips)
         if matched > 0:
-            print(f"    • {name}: {matched} flow(s) involving the source IP "
+            present_anywhere = True
+            print(f"    • {name}: {matched} TCP flow(s) involving the source IP "
                   f"→ {len(dests)} destination(s) analyzed.")
-            flows = _source_ip_flows(prof, endpoint_ips)
-            for ln in _format_flows(flows, indent="        ", limit=12):
+            for ln in _format_flows(_source_ip_flows(prof, endpoint_ips),
+                                    indent="        ", limit=12):
+                print(ln)
+            if nontcp:
+                print("        non-TCP flows (not outcome-analyzed):")
+                for ln in _format_nontcp(nontcp, indent="        ", limit=8):
+                    print(ln)
+        elif nontcp:
+            present_anywhere = True
+            total = sum(nontcp.values())
+            print(f"    • {name}: source IP present in {total} NON-TCP packet(s) "
+                  "only (UDP/ICMP) — no TCP outcomes to analyze:")
+            for ln in _format_nontcp(nontcp, indent="        ", limit=12):
                 print(ln)
         else:
-            print(f"    • {name}: source IP NOT seen here — nothing to analyze "
-                  "(App Connector may NAT the client, or wrong capture).")
+            print(f"    • {name}: source IP NOT seen here at all "
+                  "(NAT'd, or wrong capture — try --debug).")
     if not connector_usable:
-        print("\n  ⚠️  The endpoint source IP doesn't appear in ANY connector "
-              "capture, so connector\n"
-              "      break-point tracing is skipped. Either the connector "
-              "source-NATs the client\n"
-              "      (capture where the tunnel source is visible), or pass the "
-              "right IP with --src.")
+        if present_anywhere:
+            print("\n  ⚠️  The source IP appears in the connector capture(s) only in "
+                  "NON-TCP traffic, so\n"
+                  "      TCP break-point tracing is skipped (the flows are listed "
+                  "above). The app's\n"
+                  "      brokered TCP sessions may NAT the client, or be in a "
+                  "different capture.")
+        else:
+            print("\n  ⚠️  The endpoint source IP doesn't appear in ANY connector "
+                  "capture, so connector\n"
+                  "      break-point tracing is skipped. Either the connector "
+                  "source-NATs the client\n"
+                  "      (capture where the tunnel source is visible), or pass the "
+                  "right IP with --src.")
 
 
 def _print_missing(missing, has_connector):
