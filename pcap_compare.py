@@ -547,6 +547,25 @@ def _connector_trace(d, conn_dns_failed, conn_by_fqdn, conn_by_ip):
     return "reached the App Connector, outcome unclear there"
 
 
+def _inbound_failures(connectors, endpoint_ips):
+    """
+    Connector flows where something is trying to REACH an endpoint source IP
+    (the endpoint IP is the SYN destination) and the connection FAILS — SYN with
+    no SYN-ACK, RST, or a half-open connect with no data. Aggregated by
+    (connector, source, endpoint IP, port, outcome) -> count of attempts.
+    """
+    agg = {}
+    for prof in connectors:
+        name = os.path.basename(prof.get("path", "")) or "connector"
+        for s in prof["streams"].values():
+            if s.server_ip in endpoint_ips and s.outcome() in (
+                    "no_response", "reset", "half_open"):
+                key = (name, s.client_ip or "?", s.server_ip, s.server_port,
+                       s.outcome())
+                agg[key] = agg.get(key, 0) + 1
+    return agg
+
+
 def report(good, bad, connectors=None, src_override=None):
     connectors = connectors or []
     _print_ignore_banner()
@@ -629,12 +648,14 @@ def report(good, bad, connectors=None, src_override=None):
         missing.append((d, reason, trace))
 
     show_conn = bool(connectors) and connector_usable
+    inbound = _inbound_failures(connectors, endpoint_ips) if (connectors and endpoint_ips) else {}
     _print_summary(good, bad, per_connector, good_dests, bad_dests, required, ignored)
     _print_correlation(endpoint_ips, per_connector, bool(connectors),
                        connector_usable, bool(src_override))
     _print_missing(missing, show_conn)
     _print_reachable(reachable)
     _print_unnamed(missing)
+    _print_inbound(inbound)
 
 
 def _fmt_dest(d):
@@ -747,6 +768,27 @@ def _print_reachable(reachable):
     for d in reachable:
         name, port, _ = _fmt_dest(d)
         print(f"  • {name}:{port}")
+
+
+_INBOUND_LABEL = {
+    "no_response": "SYN, no SYN-ACK",
+    "reset": "RST (reset)",
+    "half_open": "SYN-ACK but no data",
+}
+
+
+def _print_inbound(agg):
+    """Report failing connector flows aimed AT the endpoint source IP."""
+    if not agg:
+        return
+    print(f"\n{'=' * 60}")
+    print(f"🔻  INBOUND FAILURES TOWARD THE SOURCE IP ({len(agg)})")
+    print(f"{'=' * 60}")
+    print("  Something in the connector capture(s) tried to REACH the endpoint")
+    print("  source IP and the connection failed:")
+    for (name, src, dst, port, oc), count in sorted(agg.items()):
+        times = f"  (×{count})" if count > 1 else ""
+        print(f"  • {src} → {dst}:{port}   {_INBOUND_LABEL[oc]}{times}   [{name}]")
 
 
 def _print_unnamed(missing):

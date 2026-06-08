@@ -57,6 +57,18 @@ with a warning. Override the auto-detected IP with `--src IP` (repeatable, or
 comma-separated) — e.g. when the connector sees a ZPA-assigned source IP that
 differs from the endpoint's local IP.
 
+Both directions are considered. The break-point trace covers the source IP
+**reaching app servers**; separately, an **inbound-failures** section reports
+flows in the connector capture(s) where something is trying to **reach the source
+IP itself and failing** (SYN with no SYN-ACK, RST, or a half-open connect) — e.g.
+a broker/health-check dialing back toward the assigned source IP:
+
+```
+🔻  INBOUND FAILURES TOWARD THE SOURCE IP (2)
+  • 100.64.0.9 → 10.6.0.2:443    SYN, no SYN-ACK   [appconn1.pcap]
+  • 100.64.0.9 → 10.6.0.2:8443   RST (reset)       [appconn1.pcap]
+```
+
 **Multiple connectors:** ZPA connector groups load-balance, so an app's flows can
 be brokered by any connector in the group. You can pass **several** App Connector
 captures (multi-select in the dialog, or list them on the command line). They're
